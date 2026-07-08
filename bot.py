@@ -20,15 +20,13 @@ log = logging.getLogger("bot")
 # ------------------ НАСТРОЙКИ (берутся из переменных окружения) ------------------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])  # ваш Telegram ID
-SHEET_NAME = os.environ.get("SHEET_NAME", "Прокат Elektro VLG")
+SHEET_ID = os.environ["SHEET_ID"]  # ID таблицы из ссылки (между /d/ и /edit)
 
-# Учётные данные Google берутся из переменной окружения GOOGLE_CREDS
-# (туда нужно вставить ВЕСЬ текст скачанного JSON-файла целиком)
 creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 credentials = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 gc = gspread.authorize(credentials)
-sh = gc.open(SHEET_NAME)
+sh = gc.open_by_key(SHEET_ID)
 
 bikes_ws = sh.worksheet("Велосипеды")
 clients_ws = sh.worksheet("Клиенты")
@@ -46,7 +44,7 @@ def get_free_bikes():
 
 def get_bike_by_id(bike_id):
     rows = bikes_ws.get_all_records()
-    for i, r in enumerate(rows, start=2):  # строка 1 — заголовки
+    for i, r in enumerate(rows, start=2):
         if str(r.get("id")) == str(bike_id):
             return r, i
     return None, None
@@ -95,20 +93,6 @@ def get_active_rentals():
     return rentals_ws.get_all_records()
 
 
-def add_expense(category, amount, owner, comment):
-    rows = finances_ws.get_all_records()
-    new_id = len(rows) + 1
-    finances_ws.append_row([
-        new_id, datetime.now().strftime("%d.%m.%Y"), "расход",
-        category, amount, owner, comment
-    ])
-    return new_id
-
-
-def get_finance_rows():
-    return finances_ws.get_all_records()
-
-
 def mark_paid(rental_id):
     rows = rentals_ws.get_all_records()
     for i, r in enumerate(rows, start=2):
@@ -128,6 +112,20 @@ def mark_returned(rental_id):
             set_bike_status(r.get("bike_id"), "свободен")
             return True
     return False
+
+
+def add_expense(category, amount, owner, comment):
+    rows = finances_ws.get_all_records()
+    new_id = len(rows) + 1
+    finances_ws.append_row([
+        new_id, datetime.now().strftime("%d.%m.%Y"), "расход",
+        category, amount, owner, comment
+    ])
+    return new_id
+
+
+def get_finance_rows():
+    return finances_ws.get_all_records()
 
 
 # ------------------ БОТ ------------------
@@ -242,7 +240,6 @@ async def choose_period(callback: CallbackQuery, state: FSMContext):
 @router.message(Command("my"))
 async def cmd_my(message: Message):
     rows = get_active_rentals()
-    my_rentals = []
     client_rows = clients_ws.get_all_records()
     my_client_id = None
     for r in client_rows:
@@ -251,9 +248,10 @@ async def cmd_my(message: Message):
     if my_client_id is None:
         await message.answer("Вы ещё не регистрировались — введите /start")
         return
-    for r in rows:
-        if str(r.get("client_id")) == str(my_client_id) and r.get("return_status") == "арендован":
-            my_rentals.append(r)
+    my_rentals = [
+        r for r in rows
+        if str(r.get("client_id")) == str(my_client_id) and r.get("return_status") == "арендован"
+    ]
     if not my_rentals:
         await message.answer("Активных аренд нет.")
         return
@@ -324,7 +322,6 @@ async def cmd_return(message: Message):
 async def cmd_expense(message: Message):
     if not admin_only(message.from_user.id):
         return
-    # формат: /expense Я 1500 ремонт замена камеры
     parts = message.text.split(maxsplit=4)
     if len(parts) < 4:
         await message.answer(
@@ -416,7 +413,7 @@ async def check_reminders():
 
 async def main():
     scheduler = AsyncIOScheduler(timezone="Europe/Volgograd")
-    scheduler.add_job(check_reminders, "cron", hour=10, minute=0)  # каждый день в 10:00
+    scheduler.add_job(check_reminders, "cron", hour=10, minute=0)
     scheduler.start()
     log.info("Бот запущен")
     await dp.start_polling(bot)
