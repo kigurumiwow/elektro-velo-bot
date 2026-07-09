@@ -21,10 +21,13 @@ log = logging.getLogger("bot")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_ID = int(os.environ["ADMIN_ID"])
 SHEET_ID = os.environ["SHEET_ID"]
+_friend_env = os.environ.get("FRIEND_ID")
+FRIEND_ID = int(_friend_env) if _friend_env else None
 
 BUSINESS_ADDRESS = "г. Волгоград, ул. Киргизская 2"
 BUSINESS_PHONE = "8-960-896-06-06"
 DELIVERY_PRICE = 500
+TO_INTERVAL_DAYS = 30
 
 creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -46,16 +49,27 @@ def ensure_column(ws, column_name):
         ws.update_cell(1, len(headers) + 1, column_name)
 
 
+def ensure_worksheet(title, headers):
+    try:
+        ws = sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sh.add_worksheet(title=title, rows=200, cols=len(headers))
+        ws.append_row(headers)
+    return ws
+
+
 def ensure_all_columns():
     ensure_column(clients_ws, "blacklist")
     ensure_column(rentals_ws, "delivery")
     ensure_column(rentals_ws, "delivery_address")
     ensure_column(finances_ws, "bike_id")
+    ensure_column(bikes_ws, "photo_id")
 
 
 ensure_all_columns()
+waiting_ws = ensure_worksheet("Ожидание", ["id", "telegram_id", "name", "date_added"])
 
-# ------------------ РАБОТА С ВЕЛОСИПЕДАМИ ------------------
+# ------------------ ВЕЛОСИПЕДЫ ------------------
 
 def get_free_bikes():
     rows = bikes_ws.get_all_records()
@@ -77,7 +91,16 @@ def set_bike_status(bike_id, status):
         bikes_ws.update_cell(row_idx, col, status)
 
 
-# ------------------ РАБОТА С КЛИЕНТАМИ ------------------
+def set_bike_photo(bike_id, file_id):
+    _, row_idx = get_bike_by_id(bike_id)
+    if row_idx:
+        col = bikes_ws.find("photo_id").col
+        bikes_ws.update_cell(row_idx, col, file_id)
+        return True
+    return False
+
+
+# ------------------ КЛИЕНТЫ ------------------
 
 def get_or_create_client(tg_id, name, phone):
     rows = clients_ws.get_all_records()
@@ -113,7 +136,32 @@ def is_blacklisted(client_id):
     return False
 
 
-# ------------------ РАБОТА С АРЕНДАМИ ------------------
+def get_all_clients():
+    return clients_ws.get_all_records()
+
+
+# ------------------ ЛИСТ ОЖИДАНИЯ ------------------
+
+def add_to_waitlist(tg_id, name):
+    rows = waiting_ws.get_all_records()
+    for r in rows:
+        if str(r.get("telegram_id")) == str(tg_id):
+            return False
+    new_id = len(rows) + 1
+    waiting_ws.append_row([new_id, tg_id, name, datetime.now().strftime("%d.%m.%Y %H:%M")])
+    return True
+
+
+def get_waitlist():
+    return waiting_ws.get_all_records()
+
+
+def clear_waitlist():
+    waiting_ws.clear()
+    waiting_ws.append_row(["id", "telegram_id", "name", "date_added"])
+
+
+# ------------------ АРЕНДЫ ------------------
 
 def create_rental(bike_id, client_id, period, price, owner, delivery="нет", delivery_address=""):
     rows = rentals_ws.get_all_records()
@@ -126,7 +174,7 @@ def create_rental(bike_id, client_id, period, price, owner, delivery="нет", d
         price, owner, "не оплачено", "арендован", delivery, delivery_address
     ])
     set_bike_status(bike_id, "в аренде")
-    return new_id, end
+    return new_id, start, end
 
 
 def get_rental_by_id(rental_id):
@@ -211,6 +259,27 @@ def get_bike_finances(bike_id):
     return [r for r in rows if str(r.get("bike_id")) == str(bike_id)]
 
 
+# ------------------ ДОГОВОР ------------------
+
+def generate_contract_text(rental_id, client_name, phone, bike_name, period, price,
+                            start, end, delivery, delivery_address):
+    pickup = (f"доставка по адресу: {delivery_address}" if delivery == "да"
+              else f"самовывоз, {BUSINESS_ADDRESS}")
+    return (
+        f"📄 Договор аренды электровелосипеда №{rental_id}\n\n"
+        f"Арендатор: {client_name}, тел. {phone or '—'}\n"
+        f"Предмет аренды: {bike_name}\n"
+        f"Срок аренды: {period} (с {start} по {end})\n"
+        f"Стоимость: {price}₽\n"
+        f"Получение: {pickup}\n"
+        f"Контакт арендодателя: {BUSINESS_PHONE}\n\n"
+        f"Арендатор обязуется бережно эксплуатировать велосипед и вернуть его в исправном "
+        f"состоянии в указанный срок. В случае повреждения по вине арендатора стоимость "
+        f"ремонта оплачивается арендатором.\n\n"
+        f"Подтверждая аренду в боте, арендатор соглашается с условиями договора."
+    )
+
+
 # ------------------ КЛАВИАТУРЫ ------------------
 
 def paid_button(rental_id):
@@ -226,6 +295,12 @@ def rental_action_buttons(rental_id, unpaid):
     buttons.append([InlineKeyboardButton(text="🔄 Продлить", callback_data=f"extend_{rental_id}")])
     buttons.append([InlineKeyboardButton(text="🚲 Вернуть велосипед", callback_data=f"claim_return_{rental_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def waitlist_button():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔔 Уведомить когда освободится", callback_data="waitlist_join")]
+    ])
 
 
 # ------------------ БОТ ------------------
@@ -253,8 +328,20 @@ class Extend(StatesGroup):
     choosing_period = State()
 
 
+class SetPhoto(StatesGroup):
+    waiting_photo = State()
+
+
 def admin_only(user_id):
     return user_id == ADMIN_ID
+
+
+def get_role(user_id):
+    if user_id == ADMIN_ID:
+        return "admin"
+    if FRIEND_ID and user_id == FRIEND_ID:
+        return "friend"
+    return None
 
 
 @router.message(Command("start"))
@@ -297,7 +384,10 @@ async def cmd_rent(message: Message, state: FSMContext):
         )
     free_bikes = get_free_bikes()
     if not free_bikes:
-        await message.answer("Сейчас все велосипеды заняты, попробуйте позже 🙁")
+        await message.answer(
+            "Сейчас все велосипеды заняты, попробуйте позже 🙁",
+            reply_markup=waitlist_button()
+        )
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=b["name_model"], callback_data=f"bike_{b['id']}")]
@@ -305,6 +395,16 @@ async def cmd_rent(message: Message, state: FSMContext):
     ])
     await message.answer("Выберите велосипед:", reply_markup=kb)
     await state.set_state(Rent.choosing_bike)
+
+
+@router.callback_query(F.data == "waitlist_join")
+async def waitlist_join(callback: CallbackQuery):
+    get_or_create_client(callback.from_user.id, callback.from_user.full_name, "")
+    added = add_to_waitlist(callback.from_user.id, callback.from_user.full_name)
+    if added:
+        await callback.answer("Записали! Уведомим как только освободится велосипед 🔔", show_alert=True)
+    else:
+        await callback.answer("Вы уже в списке ожидания", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("bike_"))
@@ -316,6 +416,8 @@ async def choose_bike(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data="period_неделя")],
         [InlineKeyboardButton(text=f"Месяц — {bike['price_month']}₽", callback_data="period_месяц")],
     ])
+    if bike.get("photo_id"):
+        await callback.message.answer_photo(bike["photo_id"], caption=bike["name_model"])
     await callback.message.edit_text(f"Выбран: {bike['name_model']}\nНа какой срок?", reply_markup=kb)
     await state.set_state(Rent.choosing_period)
 
@@ -328,10 +430,7 @@ async def choose_period(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="🚶 Заберу сам(а), бесплатно", callback_data="pickup_self")],
         [InlineKeyboardButton(text=f"🚚 Доставка (+{DELIVERY_PRICE}₽)", callback_data="pickup_delivery")],
     ])
-    await callback.message.edit_text(
-        f"Срок: {period}\nКак заберёте велосипед?",
-        reply_markup=kb
-    )
+    await callback.message.edit_text(f"Срок: {period}\nКак заберёте велосипед?", reply_markup=kb)
     await state.set_state(Rent.choosing_delivery)
 
 
@@ -362,14 +461,15 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
 
     user = event.from_user
     client_id = get_or_create_client(user.id, user.full_name, "")
-    rental_id, end_date = create_rental(bike_id, client_id, period, price, bike["owner"], delivery, delivery_address)
+    client = get_client_by_tg(user.id)
+    rental_id, start_dt, end_dt = create_rental(bike_id, client_id, period, price, bike["owner"], delivery, delivery_address)
 
     text = (
         f"Готово! ✅\n\n"
         f"Велосипед: {bike['name_model']}\n"
         f"Срок: {period}\n"
         f"Сумма: {price}₽" + (f" (включая доставку {DELIVERY_PRICE}₽)" if delivery == "да" else "") + "\n"
-        f"Вернуть/продлить до: {end_date.strftime('%d.%m.%Y')}\n\n"
+        f"Вернуть/продлить до: {end_dt.strftime('%d.%m.%Y')}\n\n"
     )
     if delivery == "да":
         text += f"🚚 Доставим по адресу: {delivery_address}\nТелефон для связи: {BUSINESS_PHONE}\n\n"
@@ -385,6 +485,14 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
         chat = event.chat.id
 
     await bot.send_message(chat, "Нажмите, когда переведёте оплату:", reply_markup=paid_button(rental_id))
+
+    contract = generate_contract_text(
+        rental_id, user.full_name, client["phone"] if client else "",
+        bike["name_model"], period, price,
+        start_dt.strftime("%d.%m.%Y"), end_dt.strftime("%d.%m.%Y"),
+        delivery, delivery_address
+    )
+    await bot.send_message(chat, contract)
 
     await bot.send_message(
         ADMIN_ID,
@@ -480,12 +588,12 @@ async def extend_confirm(callback: CallbackQuery, state: FSMContext):
 
     set_return_status(old_rental_id, "продлена")
     client_id = get_or_create_client(callback.from_user.id, callback.from_user.full_name, "")
-    new_id, end_date = create_rental(bike_id, client_id, period, price, bike["owner"])
+    new_id, start_dt, end_dt = create_rental(bike_id, client_id, period, price, bike["owner"])
 
     await callback.message.edit_text(
         f"Продлено ✅\n\n"
         f"Новая аренда #{new_id}, срок: {period}, сумма: {price}₽\n"
-        f"До: {end_date.strftime('%d.%m.%Y')}\n\n"
+        f"До: {end_dt.strftime('%d.%m.%Y')}\n\n"
         f"Когда оплатите — нажмите кнопку ниже 👇"
     )
     await callback.message.answer("Оплата за продление:", reply_markup=paid_button(new_id))
@@ -497,7 +605,7 @@ async def extend_confirm(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
 
-# ------------------ ВОЗВРАТ ВЕЛОСИПЕДА КЛИЕНТОМ ------------------
+# ------------------ ВОЗВРАТ ------------------
 
 @router.callback_query(F.data.startswith("claim_return_"))
 async def claim_return(callback: CallbackQuery):
@@ -530,6 +638,7 @@ async def confirm_return(callback: CallbackQuery):
     tg_id = get_client_telegram_id(rental["client_id"])
     if tg_id:
         await bot.send_message(tg_id, f"Возврат велосипеда по аренде #{rental_id} подтверждён, спасибо! 🚲")
+    await notify_and_clear_waitlist()
 
 
 # ------------------ МОИ АРЕНДЫ ------------------
@@ -602,6 +711,7 @@ async def cmd_return(message: Message):
         return
     if mark_returned(parts[1]):
         await message.answer(f"Аренда #{parts[1]} закрыта, велосипед снова свободен ✅")
+        await notify_and_clear_waitlist()
     else:
         await message.answer("Не найдено такой аренды.")
 
@@ -610,7 +720,6 @@ async def cmd_return(message: Message):
 async def cmd_expense(message: Message):
     if not admin_only(message.from_user.id):
         return
-    # /expense Владелец bike_id Сумма Категория Комментарий
     parts = message.text.split(maxsplit=5)
     if len(parts) < 5:
         await message.answer(
@@ -635,7 +744,8 @@ async def cmd_expense(message: Message):
 
 @router.message(Command("report"))
 async def cmd_report(message: Message):
-    if not admin_only(message.from_user.id):
+    role = get_role(message.from_user.id)
+    if role is None:
         return
     finances = get_finance_rows()
     income_me = sum(int(r["sum"]) for r in finances if r.get("type") == "доход" and r.get("owner") == "Я")
@@ -643,12 +753,20 @@ async def cmd_report(message: Message):
     expense_me = sum(int(r["sum"]) for r in finances if r.get("type") == "расход" and r.get("owner") == "Я")
     expense_friend = sum(int(r["sum"]) for r in finances if r.get("type") == "расход" and r.get("owner") == "Денц")
 
-    await message.answer(
-        f"📊 Отчёт\n\n"
-        f"— Доходы —\nМоя доля: {income_me}₽\nДоля Денца: {income_friend}₽\n\n"
-        f"— Расходы —\nМои: {expense_me}₽\nДенца: {expense_friend}₽\n\n"
-        f"— Итого чистыми —\nЯ: {income_me - expense_me}₽\nДенц: {income_friend - expense_friend}₽"
-    )
+    if role == "admin":
+        await message.answer(
+            f"📊 Отчёт\n\n"
+            f"— Доходы —\nМоя доля: {income_me}₽\nДоля Денца: {income_friend}₽\n\n"
+            f"— Расходы —\nМои: {expense_me}₽\nДенца: {expense_friend}₽\n\n"
+            f"— Итого чистыми —\nЯ: {income_me - expense_me}₽\nДенц: {income_friend - expense_friend}₽"
+        )
+    else:
+        await message.answer(
+            f"📊 Ваш отчёт\n\n"
+            f"Доход: {income_friend}₽\n"
+            f"Расходы: {expense_friend}₽\n"
+            f"Чистыми: {income_friend - expense_friend}₽"
+        )
 
 
 @router.message(Command("stats"))
@@ -661,7 +779,7 @@ async def cmd_stats(message: Message):
     rented = len([b for b in bikes if b.get("status") == "в аренде"])
     maintenance = len([b for b in bikes if b.get("status") == "на обслуживании"])
 
-    clients = clients_ws.get_all_records()
+    clients = get_all_clients()
     total_clients = len(clients)
 
     finances = get_finance_rows()
@@ -725,7 +843,73 @@ async def cmd_blacklist(message: Message):
     await message.answer("Клиент не найден")
 
 
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    text = message.text.replace("/broadcast", "", 1).strip()
+    if not text:
+        await message.answer("Использование: /broadcast текст сообщения")
+        return
+    clients = get_all_clients()
+    sent = 0
+    for r in clients:
+        tg = r.get("telegram_id")
+        if not tg:
+            continue
+        try:
+            await bot.send_message(tg, f"📢 {text}")
+            sent += 1
+        except Exception as e:
+            log.warning(f"Не удалось отправить {tg}: {e}")
+    await message.answer(f"Разослано {sent} клиентам")
+
+
+@router.message(Command("set_photo"))
+async def cmd_set_photo(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /set_photo ID_велосипеда, затем пришлите фото следующим сообщением")
+        return
+    bike, _ = get_bike_by_id(parts[1])
+    if not bike:
+        await message.answer("Велосипед не найден")
+        return
+    await state.update_data(photo_bike_id=parts[1])
+    await message.answer(f"Пришлите фото для {bike['name_model']}:")
+    await state.set_state(SetPhoto.waiting_photo)
+
+
+@router.message(SetPhoto.waiting_photo, F.photo)
+async def photo_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    bike_id = data["photo_bike_id"]
+    file_id = message.photo[-1].file_id
+    if set_bike_photo(bike_id, file_id):
+        await message.answer("Фото сохранено ✅")
+    else:
+        await message.answer("Не удалось сохранить, велосипед не найден")
+    await state.clear()
+
+
 # ------------------ НАПОМИНАНИЯ ------------------
+
+async def notify_and_clear_waitlist():
+    rows = get_waitlist()
+    if not rows:
+        return
+    for r in rows:
+        tg_id = r.get("telegram_id")
+        if not tg_id:
+            continue
+        try:
+            await bot.send_message(tg_id, "🚲 Велосипед освободился! Успейте забронировать: /rent")
+        except Exception as e:
+            log.warning(f"Не удалось уведомить {tg_id}: {e}")
+    clear_waitlist()
+
 
 async def check_reminders():
     rows = get_active_rentals()
@@ -769,9 +953,32 @@ async def check_reminders():
                 )
 
 
+async def check_maintenance():
+    bikes = bikes_ws.get_all_records()
+    today = datetime.now().date()
+    for b in bikes:
+        if b.get("status") == "на обслуживании":
+            continue
+        last_to = b.get("last_TO")
+        if not last_to:
+            continue
+        try:
+            last_to_date = datetime.strptime(str(last_to), "%d.%m.%Y").date()
+        except Exception:
+            continue
+        days_since = (today - last_to_date).days
+        if days_since >= TO_INTERVAL_DAYS and (days_since - TO_INTERVAL_DAYS) % 7 == 0:
+            await bot.send_message(
+                ADMIN_ID,
+                f"🔧 Пора на ТО: {b['name_model']} (id {b['id']}) — последнее обслуживание {last_to}, "
+                f"прошло {days_since} дней"
+            )
+
+
 async def main():
     scheduler = AsyncIOScheduler(timezone="Europe/Volgograd")
     scheduler.add_job(check_reminders, "cron", hour=10, minute=0)
+    scheduler.add_job(check_maintenance, "cron", hour=10, minute=5)
     scheduler.start()
     log.info("Бот запущен")
     await dp.start_polling(bot)
