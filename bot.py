@@ -89,18 +89,33 @@ def get_client_telegram_id(client_id):
     return None
 
 
+def get_rental_by_id(rental_id):
+    rows = rentals_ws.get_all_records()
+    for i, r in enumerate(rows, start=2):
+        if str(r.get("id")) == str(rental_id):
+            return r, i
+    return None, None
+
+
 def get_active_rentals():
     return rentals_ws.get_all_records()
 
 
-def mark_paid(rental_id):
-    rows = rentals_ws.get_all_records()
-    for i, r in enumerate(rows, start=2):
-        if str(r.get("id")) == str(rental_id):
-            col = rentals_ws.find("payment_status").col
-            rentals_ws.update_cell(i, col, "оплачено")
-            return True
+def set_payment_status(rental_id, status):
+    _, row_idx = get_rental_by_id(rental_id)
+    if row_idx:
+        col = rentals_ws.find("payment_status").col
+        rentals_ws.update_cell(row_idx, col, status)
+        return True
     return False
+
+
+def mark_paid(rental_id):
+    return set_payment_status(rental_id, "оплачено")
+
+
+def mark_pending(rental_id):
+    return set_payment_status(rental_id, "ожидает подтверждения")
 
 
 def mark_returned(rental_id):
@@ -126,6 +141,12 @@ def add_expense(category, amount, owner, comment):
 
 def get_finance_rows():
     return finances_ws.get_all_records()
+
+
+def paid_button(rental_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"claim_paid_{rental_id}")]
+    ])
 
 
 # ------------------ БОТ ------------------
@@ -225,7 +246,11 @@ async def choose_period(callback: CallbackQuery, state: FSMContext):
         f"Сумма: {price}₽\n"
         f"Оплата: наличными/переводом\n"
         f"Вернуть/продлить до: {end_date.strftime('%d.%m.%Y')}\n\n"
-        f"Я напомню заранее об окончании срока 🙂"
+        f"Когда оплатите — нажмите кнопку ниже 👇"
+    )
+    await callback.message.answer(
+        "Нажмите, когда переведёте оплату:",
+        reply_markup=paid_button(rental_id)
     )
     await bot.send_message(
         ADMIN_ID,
@@ -235,6 +260,65 @@ async def choose_period(callback: CallbackQuery, state: FSMContext):
         f"Владелец велика: {bike['owner']}"
     )
     await state.clear()
+
+
+@router.callback_query(F.data.startswith("claim_paid_"))
+async def claim_paid(callback: CallbackQuery):
+    rental_id = callback.data.split("_")[-1]
+    rental, _ = get_rental_by_id(rental_id)
+    if not rental:
+        await callback.answer("Аренда не найдена", show_alert=True)
+        return
+    if rental.get("payment_status") == "оплачено":
+        await callback.answer("Уже подтверждено ✅", show_alert=True)
+        return
+    mark_pending(rental_id)
+    await callback.message.edit_text(
+        callback.message.text + "\n\n⏳ Ждём подтверждения от администратора..."
+    )
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_paid_{rental_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_paid_{rental_id}"),
+    ]])
+    await bot.send_message(
+        ADMIN_ID,
+        f"💰 Клиент отметил оплату по аренде #{rental_id}\n"
+        f"Сумма: {rental['amount']}₽ | Владелец: {rental['owner']}\n"
+        f"Проверьте поступление и подтвердите:",
+        reply_markup=admin_kb
+    )
+
+
+@router.callback_query(F.data.startswith("confirm_paid_"))
+async def confirm_paid(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    rental_id = callback.data.split("_")[-1]
+    rental, _ = get_rental_by_id(rental_id)
+    mark_paid(rental_id)
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Оплата подтверждена")
+    tg_id = get_client_telegram_id(rental["client_id"])
+    if tg_id:
+        await bot.send_message(tg_id, f"Оплата по аренде #{rental_id} подтверждена ✅ Спасибо!")
+
+
+@router.callback_query(F.data.startswith("reject_paid_"))
+async def reject_paid(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    rental_id = callback.data.split("_")[-1]
+    rental, _ = get_rental_by_id(rental_id)
+    set_payment_status(rental_id, "не оплачено")
+    await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
+    tg_id = get_client_telegram_id(rental["client_id"])
+    if tg_id:
+        await bot.send_message(
+            tg_id,
+            f"По аренде #{rental_id} мы не нашли поступление оплаты. "
+            f"Пожалуйста, свяжитесь с нами или проверьте перевод."
+        )
 
 
 @router.message(Command("my"))
@@ -255,15 +339,17 @@ async def cmd_my(message: Message):
     if not my_rentals:
         await message.answer("Активных аренд нет.")
         return
-    text = "Ваши активные аренды:\n\n"
     for r in my_rentals:
-        text += (
+        text = (
             f"Аренда #{r['id']}\n"
             f"До: {r['end_date']}\n"
             f"Сумма: {r['amount']}₽\n"
-            f"Оплата: {r['payment_status']}\n\n"
+            f"Оплата: {r['payment_status']}"
         )
-    await message.answer(text)
+        if r["payment_status"] == "не оплачено":
+            await message.answer(text, reply_markup=paid_button(r["id"]))
+        else:
+            await message.answer(text)
 
 
 # ------------------ АДМИНСКИЕ КОМАНДЫ (только для вас) ------------------
@@ -387,17 +473,20 @@ async def check_reminders():
         tg_id = get_client_telegram_id(r["client_id"])
         if not tg_id:
             continue
+        unpaid = r.get("payment_status") != "оплачено"
         if days_left == 1:
             await bot.send_message(
                 tg_id,
                 f"⏰ Напоминание: завтра ({r['end_date']}) заканчивается срок аренды "
-                f"(сумма {r['amount']}₽). Продлить — /rent, вопросы — напишите нам."
+                f"(сумма {r['amount']}₽). Продлить — /rent, вопросы — напишите нам.",
+                reply_markup=paid_button(r["id"]) if unpaid else None
             )
         elif days_left == 0:
             await bot.send_message(
                 tg_id,
                 f"⚠️ Сегодня последний день аренды. Нужно вернуть велосипед "
-                f"или продлить аренду, иначе оплата продолжит копиться."
+                f"или продлить аренду, иначе оплата продолжит копиться.",
+                reply_markup=paid_button(r["id"]) if unpaid else None
             )
             await bot.send_message(
                 ADMIN_ID,
