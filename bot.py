@@ -466,7 +466,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.update_data(pending_bike_id=bike_id)
     await message.answer(
         "Привет! Это бот проката электровелосипедов.\n\n"
-        "Давай зарегистрируемся. Как тебя зовут?"
+        "Давай зарегистрируемся. Напиши своё ФИО полностью, как в паспорте:"
     )
     await state.set_state(Registration.waiting_name)
 
@@ -743,7 +743,7 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
         "rental_id": rental_id,
         "contract_date": ru_date(date_cls.today()),
         "business_phone": BUSINESS_PHONE,
-        "full_name": user.full_name,
+        "full_name": client["name"] if client else user.full_name,
         "passport_series": client.get("passport_series", "") if client else "",
         "passport_number": client.get("passport_number", "") if client else "",
         "registration_address": client.get("registration_address", "") if client else "",
