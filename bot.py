@@ -1,15 +1,19 @@
 import os
+import io
 import json
 import logging
 from datetime import datetime, timedelta
 
+import qrcode
 import gspread
 from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+)
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -24,6 +28,7 @@ SHEET_ID = os.environ["SHEET_ID"]
 _friend_env = os.environ.get("FRIEND_ID")
 FRIEND_ID = int(_friend_env) if _friend_env else None
 
+BOT_USERNAME = "elektro_vlg_bot"
 BUSINESS_ADDRESS = "г. Волгоград, ул. Киргизская 2"
 BUSINESS_PHONE = "8-960-896-06-06"
 DELIVERY_PRICE = 500
@@ -64,6 +69,7 @@ def ensure_all_columns():
     ensure_column(rentals_ws, "delivery_address")
     ensure_column(finances_ws, "bike_id")
     ensure_column(bikes_ws, "photo_id")
+    ensure_column(clients_ws, "passport")
 
 
 ensure_all_columns()
@@ -102,13 +108,13 @@ def set_bike_photo(bike_id, file_id):
 
 # ------------------ КЛИЕНТЫ ------------------
 
-def get_or_create_client(tg_id, name, phone):
+def get_or_create_client(tg_id, name, phone, passport=""):
     rows = clients_ws.get_all_records()
     for r in rows:
         if str(r.get("telegram_id")) == str(tg_id):
             return r.get("id")
     new_id = len(rows) + 1
-    clients_ws.append_row([new_id, tg_id, name, phone, datetime.now().strftime("%d.%m.%Y"), "нет"])
+    clients_ws.append_row([new_id, tg_id, name, phone, datetime.now().strftime("%d.%m.%Y"), "нет", passport])
     return new_id
 
 
@@ -230,6 +236,16 @@ def mark_returned(rental_id):
     return False
 
 
+def cancel_rental(rental_id):
+    rental, row_idx = get_rental_by_id(rental_id)
+    if row_idx and rental.get("return_status") == "арендован":
+        col = rentals_ws.find("return_status").col
+        rentals_ws.update_cell(row_idx, col, "отменена")
+        set_bike_status(rental["bike_id"], "свободен")
+        return True
+    return False
+
+
 # ------------------ ФИНАНСЫ ------------------
 
 def add_finance_row(ftype, category, amount, owner, comment, bike_id=""):
@@ -261,13 +277,14 @@ def get_bike_finances(bike_id):
 
 # ------------------ ДОГОВОР ------------------
 
-def generate_contract_text(rental_id, client_name, phone, bike_name, period, price,
+def generate_contract_text(rental_id, client_name, phone, passport, bike_name, period, price,
                             start, end, delivery, delivery_address):
     pickup = (f"доставка по адресу: {delivery_address}" if delivery == "да"
               else f"самовывоз, {BUSINESS_ADDRESS}")
     return (
         f"📄 Договор аренды электровелосипеда №{rental_id}\n\n"
         f"Арендатор: {client_name}, тел. {phone or '—'}\n"
+        f"Паспорт: {passport or '—'}\n"
         f"Предмет аренды: {bike_name}\n"
         f"Срок аренды: {period} (с {start} по {end})\n"
         f"Стоимость: {price}₽\n"
@@ -280,7 +297,25 @@ def generate_contract_text(rental_id, client_name, phone, bike_name, period, pri
     )
 
 
+# ------------------ QR-КОД ------------------
+
+def generate_qr_image(bike_id):
+    link = f"https://t.me/{BOT_USERNAME}?start=bike_{bike_id}"
+    img = qrcode.make(link)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    return buf, link
+
+
 # ------------------ КЛАВИАТУРЫ ------------------
+
+def booking_buttons(rental_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"claim_paid_{rental_id}")],
+        [InlineKeyboardButton(text="❌ Отменить бронь", callback_data=f"cancel_rental_{rental_id}")],
+    ])
+
 
 def paid_button(rental_id):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -292,6 +327,7 @@ def rental_action_buttons(rental_id, unpaid):
     buttons = []
     if unpaid:
         buttons.append([InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"claim_paid_{rental_id}")])
+        buttons.append([InlineKeyboardButton(text="❌ Отменить бронь", callback_data=f"cancel_rental_{rental_id}")])
     buttons.append([InlineKeyboardButton(text="🔄 Продлить", callback_data=f"extend_{rental_id}")])
     buttons.append([InlineKeyboardButton(text="🚲 Вернуть велосипед", callback_data=f"claim_return_{rental_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -300,6 +336,13 @@ def rental_action_buttons(rental_id, unpaid):
 def waitlist_button():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔔 Уведомить когда освободится", callback_data="waitlist_join")]
+    ])
+
+
+def period_keyboard(bike, prefix="period_"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data=f"{prefix}неделя")],
+        [InlineKeyboardButton(text=f"Месяц — {bike['price_month']}₽", callback_data=f"{prefix}месяц")],
     ])
 
 
@@ -315,6 +358,7 @@ dp.include_router(router)
 class Registration(StatesGroup):
     waiting_name = State()
     waiting_phone = State()
+    waiting_passport = State()
 
 
 class Rent(StatesGroup):
@@ -332,6 +376,10 @@ class SetPhoto(StatesGroup):
     waiting_photo = State()
 
 
+class ReturnFlow(StatesGroup):
+    waiting_photo = State()
+
+
 def admin_only(user_id):
     return user_id == ADMIN_ID
 
@@ -344,8 +392,22 @@ def get_role(user_id):
     return None
 
 
-@router.message(Command("start"))
+@router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    payload = parts[1] if len(parts) > 1 else None
+    bike_id = payload.split("_", 1)[1] if payload and payload.startswith("bike_") else None
+
+    client = get_client_by_tg(message.from_user.id)
+    if client:
+        if bike_id:
+            await start_bike_flow(message, state, bike_id)
+        else:
+            await message.answer("С возвращением! 🙂\n\nКоманды:\n/rent — арендовать\n/my — мои аренды")
+        return
+
+    if bike_id:
+        await state.update_data(pending_bike_id=bike_id)
     await message.answer(
         "Привет! Это бот проката электровелосипедов.\n\n"
         "Давай зарегистрируемся. Как тебя зовут?"
@@ -362,15 +424,42 @@ async def reg_name(message: Message, state: FSMContext):
 
 @router.message(Registration.waiting_phone)
 async def reg_phone(message: Message, state: FSMContext):
-    data = await state.get_data()
-    get_or_create_client(message.from_user.id, data["name"], message.text)
-    await state.clear()
+    await state.update_data(phone=message.text)
     await message.answer(
-        "Регистрация завершена! ✅\n\n"
-        "Команды:\n"
-        "/rent — арендовать велосипед\n"
-        "/my — мои аренды"
+        "Спасибо! Теперь укажите серию и номер паспорта (нужно для договора аренды, "
+        "данные никому не передаются, кроме случаев поломки/спора)."
     )
+    await state.set_state(Registration.waiting_passport)
+
+
+@router.message(Registration.waiting_passport)
+async def reg_passport(message: Message, state: FSMContext):
+    data = await state.get_data()
+    get_or_create_client(message.from_user.id, data["name"], data["phone"], message.text)
+    bike_id = data.get("pending_bike_id")
+    await state.clear()
+    if bike_id:
+        await start_bike_flow(message, state, bike_id)
+    else:
+        await message.answer(
+            "Регистрация завершена! ✅\n\n"
+            "Команды:\n"
+            "/rent — арендовать велосипед\n"
+            "/my — мои аренды"
+        )
+
+
+async def start_bike_flow(message: Message, state: FSMContext, bike_id):
+    bike, _ = get_bike_by_id(bike_id)
+    if not bike or bike.get("status") != "свободен":
+        await message.answer("Этот велосипед сейчас недоступен, вот что есть свободного:")
+        await cmd_rent(message, state)
+        return
+    await state.update_data(bike_id=bike_id)
+    if bike.get("photo_id"):
+        await message.answer_photo(bike["photo_id"], caption=bike["name_model"])
+    await message.answer(f"Велосипед: {bike['name_model']}\nНа какой срок?", reply_markup=period_keyboard(bike))
+    await state.set_state(Rent.choosing_period)
 
 
 @router.message(Command("rent"))
@@ -384,10 +473,7 @@ async def cmd_rent(message: Message, state: FSMContext):
         )
     free_bikes = get_free_bikes()
     if not free_bikes:
-        await message.answer(
-            "Сейчас все велосипеды заняты, попробуйте позже 🙁",
-            reply_markup=waitlist_button()
-        )
+        await message.answer("Сейчас все велосипеды заняты, попробуйте позже 🙁", reply_markup=waitlist_button())
         return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=b["name_model"], callback_data=f"bike_{b['id']}")]
@@ -412,13 +498,9 @@ async def choose_bike(callback: CallbackQuery, state: FSMContext):
     bike_id = callback.data.split("_")[1]
     bike, _ = get_bike_by_id(bike_id)
     await state.update_data(bike_id=bike_id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data="period_неделя")],
-        [InlineKeyboardButton(text=f"Месяц — {bike['price_month']}₽", callback_data="period_месяц")],
-    ])
     if bike.get("photo_id"):
         await callback.message.answer_photo(bike["photo_id"], caption=bike["name_model"])
-    await callback.message.edit_text(f"Выбран: {bike['name_model']}\nНа какой срок?", reply_markup=kb)
+    await callback.message.edit_text(f"Выбран: {bike['name_model']}\nНа какой срок?", reply_markup=period_keyboard(bike))
     await state.set_state(Rent.choosing_period)
 
 
@@ -484,10 +566,10 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
         await event.answer(text)
         chat = event.chat.id
 
-    await bot.send_message(chat, "Нажмите, когда переведёте оплату:", reply_markup=paid_button(rental_id))
+    await bot.send_message(chat, "Управление бронью:", reply_markup=booking_buttons(rental_id))
 
     contract = generate_contract_text(
-        rental_id, user.full_name, client["phone"] if client else "",
+        rental_id, user.full_name, client["phone"] if client else "", client.get("passport", "") if client else "",
         bike["name_model"], period, price,
         start_dt.strftime("%d.%m.%Y"), end_dt.strftime("%d.%m.%Y"),
         delivery, delivery_address
@@ -503,6 +585,24 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
         + (f"Доставка: {delivery_address}" if delivery == "да" else "Самовывоз")
     )
     await state.clear()
+
+
+# ------------------ ОТМЕНА БРОНИ ------------------
+
+@router.callback_query(F.data.startswith("cancel_rental_"))
+async def cancel_rental_handler(callback: CallbackQuery):
+    rental_id = callback.data.split("_")[-1]
+    rental, _ = get_rental_by_id(rental_id)
+    if not rental or rental.get("return_status") != "арендован":
+        await callback.answer("Бронь уже не активна", show_alert=True)
+        return
+    if rental.get("payment_status") == "оплачено":
+        await callback.answer("Аренда уже оплачена, для отмены свяжитесь с нами", show_alert=True)
+        return
+    cancel_rental(rental_id)
+    await callback.message.edit_text(callback.message.text + "\n\n❌ Бронь отменена")
+    await bot.send_message(ADMIN_ID, f"❌ Клиент отменил бронь #{rental_id} (велосипед снова свободен)")
+    await notify_and_clear_waitlist()
 
 
 # ------------------ ОПЛАТА ------------------
@@ -569,11 +669,7 @@ async def extend_start(callback: CallbackQuery, state: FSMContext):
     rental, _ = get_rental_by_id(rental_id)
     bike, _ = get_bike_by_id(rental["bike_id"])
     await state.update_data(old_rental_id=rental_id, bike_id=rental["bike_id"])
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data="ext_period_неделя")],
-        [InlineKeyboardButton(text=f"Месяц — {bike['price_month']}₽", callback_data="ext_period_месяц")],
-    ])
-    await callback.message.answer("На какой срок продлить?", reply_markup=kb)
+    await callback.message.answer("На какой срок продлить?", reply_markup=period_keyboard(bike, prefix="ext_period_"))
     await state.set_state(Extend.choosing_period)
 
 
@@ -605,25 +701,36 @@ async def extend_confirm(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
 
-# ------------------ ВОЗВРАТ ------------------
+# ------------------ ВОЗВРАТ (с фотофиксацией) ------------------
 
 @router.callback_query(F.data.startswith("claim_return_"))
-async def claim_return(callback: CallbackQuery):
+async def claim_return(callback: CallbackQuery, state: FSMContext):
     rental_id = callback.data.split("_")[-1]
     rental, _ = get_rental_by_id(rental_id)
     if not rental or rental.get("return_status") != "арендован":
         await callback.answer("Аренда уже закрыта", show_alert=True)
         return
+    await state.update_data(return_rental_id=rental_id)
+    await callback.message.answer("Пришлите, пожалуйста, фото велосипеда при возврате 📸")
+    await state.set_state(ReturnFlow.waiting_photo)
+    await callback.answer()
+
+
+@router.message(ReturnFlow.waiting_photo, F.photo)
+async def return_photo_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    rental_id = data["return_rental_id"]
+    file_id = message.photo[-1].file_id
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Подтвердить возврат", callback_data=f"confirm_return_{rental_id}"),
     ]])
-    await callback.answer("Заявка на возврат отправлена администратору ✅", show_alert=True)
-    await bot.send_message(
-        ADMIN_ID,
-        f"🚲 Клиент хочет вернуть велосипед по аренде #{rental_id}\n"
-        f"Проверьте велосипед и подтвердите возврат:",
+    await bot.send_photo(
+        ADMIN_ID, file_id,
+        caption=f"🚲 Клиент хочет вернуть велосипед по аренде #{rental_id}\nПроверьте состояние и подтвердите:",
         reply_markup=admin_kb
     )
+    await message.answer("Фото получено, ждите подтверждения администратора ✅")
+    await state.clear()
 
 
 @router.callback_query(F.data.startswith("confirm_return_"))
@@ -634,7 +741,7 @@ async def confirm_return(callback: CallbackQuery):
     rental_id = callback.data.split("_")[-1]
     rental, _ = get_rental_by_id(rental_id)
     mark_returned(rental_id)
-    await callback.message.edit_text(callback.message.text + "\n\n✅ Возврат подтверждён, велосипед свободен")
+    await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ Возврат подтверждён")
     tg_id = get_client_telegram_id(rental["client_id"])
     if tg_id:
         await bot.send_message(tg_id, f"Возврат велосипеда по аренде #{rental_id} подтверждён, спасибо! 🚲")
@@ -762,9 +869,7 @@ async def cmd_report(message: Message):
         )
     else:
         await message.answer(
-            f"📊 Ваш отчёт\n\n"
-            f"Доход: {income_friend}₽\n"
-            f"Расходы: {expense_friend}₽\n"
+            f"📊 Ваш отчёт\n\nДоход: {income_friend}₽\nРасходы: {expense_friend}₽\n"
             f"Чистыми: {income_friend - expense_friend}₽"
         )
 
@@ -892,6 +997,25 @@ async def photo_received(message: Message, state: FSMContext):
     else:
         await message.answer("Не удалось сохранить, велосипед не найден")
     await state.clear()
+
+
+@router.message(Command("qr"))
+async def cmd_qr(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /qr ID_велосипеда")
+        return
+    bike, _ = get_bike_by_id(parts[1])
+    if not bike:
+        await message.answer("Велосипед не найден")
+        return
+    buf, link = generate_qr_image(parts[1])
+    await message.answer_photo(
+        BufferedInputFile(buf.read(), filename=f"qr_{parts[1]}.png"),
+        caption=f"QR для {bike['name_model']}\nСсылка: {link}\n\nРаспечатайте и приклейте на велосипед"
+    )
 
 
 # ------------------ НАПОМИНАНИЯ ------------------
