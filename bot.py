@@ -1,6 +1,7 @@
 import os
 import io
 import json
+import base64
 import logging
 from datetime import datetime, timedelta
 
@@ -31,6 +32,12 @@ ADMIN_ID = int(os.environ["ADMIN_ID"])
 SHEET_ID = os.environ["SHEET_ID"]
 _friend_env = os.environ.get("FRIEND_ID")
 FRIEND_ID = int(_friend_env) if _friend_env else None
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+openai_client = None
+if OPENAI_API_KEY:
+    from openai import AsyncOpenAI
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 BOT_USERNAME = "elektro_vlg_bot"
 BUSINESS_ADDRESS = "г. Волгоград, ул. Киргизская 2"
@@ -375,6 +382,50 @@ def waitlist_button():
     ])
 
 
+async def download_photo_b64(bot_instance, file_id):
+    file = await bot_instance.get_file(file_id)
+    buf = await bot_instance.download_file(file.file_path)
+    return base64.b64encode(buf.read()).decode()
+
+
+PASSPORT_PROMPT = (
+    "Ты помощник по распознаванию паспорта гражданина РФ. Первое фото — главная "
+    "страница (разворот с фото и личными данными), второе — страница с отметкой "
+    "о регистрации (прописка). Извлеки данные и верни СТРОГО валидный JSON без "
+    "пояснений и без markdown-разметки, в формате:\n"
+    '{"full_name": "Фамилия Имя Отчество", "dob": "ДД.ММ.ГГГГ", '
+    '"passport_series": "0000", "passport_number": "000000", '
+    '"issued_by": "текст кем выдан", "issue_date": "ДД.ММ.ГГГГ", '
+    '"department_code": "000-000", "registration_address": "полный адрес регистрации"}\n'
+    "Если что-то не удалось разобрать, оставь пустую строку в этом поле."
+)
+
+
+async def recognize_passport(bot_instance, photo_main_id, photo_reg_id):
+    if not openai_client:
+        return None
+    try:
+        img1 = await download_photo_b64(bot_instance, photo_main_id)
+        img2 = await download_photo_b64(bot_instance, photo_reg_id)
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PASSPORT_PROMPT},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img1}"}},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img2}"}},
+                ]
+            }],
+            response_format={"type": "json_object"},
+            max_tokens=500,
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        log.warning(f"Ошибка распознавания паспорта: {e}")
+        return None
+
+
 def period_keyboard(bike, prefix="period_"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data=f"{prefix}неделя")],
@@ -415,6 +466,9 @@ dp.include_router(router)
 class Registration(StatesGroup):
     waiting_name = State()
     waiting_phone = State()
+    waiting_photo_main = State()
+    waiting_photo_reg = State()
+    confirming_recognition = State()
     waiting_dob = State()
     waiting_passport = State()
     waiting_issued_by = State()
@@ -423,8 +477,6 @@ class Registration(StatesGroup):
     waiting_reg_address = State()
     waiting_actual_address_choice = State()
     waiting_actual_address_text = State()
-    waiting_photo_main = State()
-    waiting_photo_reg = State()
 
 
 class Rent(StatesGroup):
@@ -496,7 +548,80 @@ async def reg_name(message: Message, state: FSMContext):
 @router.message(Registration.waiting_phone)
 async def reg_phone(message: Message, state: FSMContext):
     await state.update_data(phone=message.text)
-    await message.answer("Укажите дату рождения (например: 15.03.1990):")
+    await message.answer("Пришлите фото главной страницы паспорта 📸")
+    await state.set_state(Registration.waiting_photo_main)
+
+
+@router.message(Registration.waiting_photo_main, F.photo)
+async def reg_photo_main(message: Message, state: FSMContext):
+    await state.update_data(photo_main=message.photo[-1].file_id)
+    await message.answer("Теперь пришлите фото страницы с пропиской 📸")
+    await state.set_state(Registration.waiting_photo_reg)
+
+
+@router.message(Registration.waiting_photo_reg, F.photo)
+async def reg_photo_reg(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photo_reg_id = message.photo[-1].file_id
+    await state.update_data(photo_reg=photo_reg_id)
+
+    recognized = None
+    if openai_client:
+        wait_msg = await message.answer("Распознаю паспорт, секунду... ⏳")
+        recognized = await recognize_passport(message.bot, data["photo_main"], photo_reg_id)
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+    if recognized:
+        await state.update_data(recognized=recognized)
+        text = (
+            "Вот что удалось распознать:\n\n"
+            f"ФИО: {recognized.get('full_name') or '—'}\n"
+            f"Дата рождения: {recognized.get('dob') or '—'}\n"
+            f"Паспорт: {recognized.get('passport_series') or '—'} {recognized.get('passport_number') or ''}\n"
+            f"Кем выдан: {recognized.get('issued_by') or '—'}\n"
+            f"Дата выдачи: {recognized.get('issue_date') or '—'}\n"
+            f"Код подразделения: {recognized.get('department_code') or '—'}\n"
+            f"Адрес регистрации: {recognized.get('registration_address') or '—'}\n\n"
+            "Всё верно?"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Всё верно", callback_data="recog_ok")],
+            [InlineKeyboardButton(text="✏️ Заполнить вручную", callback_data="recog_manual")],
+        ])
+        await message.answer(text, reply_markup=kb)
+        await state.set_state(Registration.confirming_recognition)
+    else:
+        if openai_client:
+            await message.answer("Не удалось распознать автоматически, заполним вручную.")
+        await message.answer("Укажите дату рождения (например: 15.03.1990):")
+        await state.set_state(Registration.waiting_dob)
+
+
+@router.callback_query(F.data == "recog_ok", Registration.confirming_recognition)
+async def recog_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    rec = data.get("recognized", {})
+    await state.update_data(
+        name=rec.get("full_name") or data.get("name"),
+        dob=rec.get("dob", ""),
+        passport_series=rec.get("passport_series", ""),
+        passport_number=rec.get("passport_number", ""),
+        issued_by=rec.get("issued_by", ""),
+        issue_date=rec.get("issue_date", ""),
+        department_code=rec.get("department_code", ""),
+        registration_address=rec.get("registration_address", "")
+    )
+    await callback.message.edit_text("Принято ✅")
+    await ask_actual_address(callback.message, state)
+
+
+@router.callback_query(F.data == "recog_manual", Registration.confirming_recognition)
+async def recog_manual(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Хорошо, заполним вручную.")
+    await callback.message.answer("Укажите дату рождения (например: 15.03.1990):")
     await state.set_state(Registration.waiting_dob)
 
 
@@ -543,13 +668,15 @@ async def reg_department_code(message: Message, state: FSMContext):
 @router.message(Registration.waiting_reg_address)
 async def reg_address(message: Message, state: FSMContext):
     await state.update_data(registration_address=message.text)
+    await ask_actual_address(message, state)
+
+
+async def ask_actual_address(target, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, такой же", callback_data="actual_same")],
         [InlineKeyboardButton(text="✏️ Другой адрес", callback_data="actual_diff")],
     ])
-    await message.answer(
-        "Фактический адрес проживания такой же, как прописка?", reply_markup=kb
-    )
+    await target.answer("Фактический адрес проживания такой же, как прописка?", reply_markup=kb)
     await state.set_state(Registration.waiting_actual_address_choice)
 
 
@@ -558,8 +685,7 @@ async def reg_actual_same(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.update_data(actual_address=data.get("registration_address", ""))
     await callback.message.edit_text("Принято ✅")
-    await callback.message.answer("Пришлите фото главной страницы паспорта 📸")
-    await state.set_state(Registration.waiting_photo_main)
+    await finalize_registration(callback.message, callback.from_user.id, state)
 
 
 @router.callback_query(F.data == "actual_diff", Registration.waiting_actual_address_choice)
@@ -571,34 +697,25 @@ async def reg_actual_diff(callback: CallbackQuery, state: FSMContext):
 @router.message(Registration.waiting_actual_address_text)
 async def reg_actual_address_text(message: Message, state: FSMContext):
     await state.update_data(actual_address=message.text)
-    await message.answer("Пришлите фото главной страницы паспорта 📸")
-    await state.set_state(Registration.waiting_photo_main)
+    await finalize_registration(message, message.from_user.id, state)
 
 
-@router.message(Registration.waiting_photo_main, F.photo)
-async def reg_photo_main(message: Message, state: FSMContext):
-    await state.update_data(photo_main=message.photo[-1].file_id)
-    await message.answer("Теперь пришлите фото страницы с пропиской 📸")
-    await state.set_state(Registration.waiting_photo_reg)
-
-
-@router.message(Registration.waiting_photo_reg, F.photo)
-async def reg_photo_reg(message: Message, state: FSMContext):
+async def finalize_registration(target: Message, user_id: int, state: FSMContext):
     data = await state.get_data()
     get_or_create_client(
-        message.from_user.id, data["name"], data["phone"],
+        user_id, data.get("name"), data.get("phone"),
         data.get("passport_series", ""), data.get("passport_number", ""),
         data.get("registration_address", ""), data.get("photo_main", ""),
-        message.photo[-1].file_id,
+        data.get("photo_reg", ""),
         data.get("dob", ""), data.get("issued_by", ""), data.get("issue_date", ""),
         data.get("department_code", ""), data.get("actual_address", "")
     )
     bike_id = data.get("pending_bike_id")
     await state.clear()
     if bike_id:
-        await start_bike_flow(message, state, bike_id)
+        await start_bike_flow(target, state, bike_id)
     else:
-        await message.answer(
+        await target.answer(
             "Регистрация завершена! ✅ Выберите действие в меню внизу.",
             reply_markup=main_menu_kb()
         )
