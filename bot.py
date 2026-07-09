@@ -276,6 +276,22 @@ def get_bike_finances(bike_id):
     return [r for r in rows if str(r.get("bike_id")) == str(bike_id)]
 
 
+def clear_sheet_keep_header(ws):
+    headers = ws.row_values(1)
+    ws.clear()
+    ws.append_row(headers)
+
+
+def reset_test_data():
+    clear_sheet_keep_header(rentals_ws)
+    clear_sheet_keep_header(finances_ws)
+    clear_sheet_keep_header(waiting_ws)
+    bikes = bikes_ws.get_all_records()
+    status_col = bikes_ws.find("status").col
+    for i in range(len(bikes)):
+        bikes_ws.update_cell(i + 2, status_col, "свободен")
+
+
 # ------------------ ДОГОВОР ------------------
 
 def generate_contract_text(rental_id, client_name, phone, passport, bike_name, period, price,
@@ -1033,6 +1049,38 @@ async def photo_received(message: Message, state: FSMContext):
     await state.clear()
 
 
+@router.message(Command("reset_test"))
+async def cmd_reset_test(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⚠️ Да, очистить", callback_data="confirm_reset"),
+        InlineKeyboardButton(text="Отмена", callback_data="cancel_reset"),
+    ]])
+    await message.answer(
+        "Это удалит все записи в листах «Аренды», «Финансы», «Ожидание» и вернёт "
+        "все велосипеды в статус «свободен».\n"
+        "Лист «Клиенты» не тронется.\n\nПродолжить?",
+        reply_markup=kb
+    )
+
+
+@router.callback_query(F.data == "cancel_reset")
+async def cancel_reset(callback: CallbackQuery):
+    await callback.message.edit_text("Отменено, ничего не удалено.")
+
+
+@router.callback_query(F.data == "confirm_reset")
+async def confirm_reset(callback: CallbackQuery):
+    if not admin_only(callback.from_user.id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    reset_test_data()
+    await callback.message.edit_text(
+        "✅ Тестовые данные очищены.\nАренды, финансы и лист ожидания пусты, все велосипеды свободны."
+    )
+
+
 @router.message(Command("qr"))
 async def cmd_qr(message: Message):
     if not admin_only(message.from_user.id):
@@ -1153,6 +1201,7 @@ async def setup_commands():
         BotCommand(command="broadcast", description="Рассылка клиентам"),
         BotCommand(command="set_photo", description="Добавить фото велосипеда"),
         BotCommand(command="qr", description="QR-код велосипеда"),
+        BotCommand(command="reset_test", description="Очистить тестовые данные"),
     ]
     await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
 
