@@ -12,7 +12,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile,
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -346,6 +347,16 @@ def period_keyboard(bike, prefix="period_"):
     ])
 
 
+def main_menu_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🚲 Арендовать велосипед")],
+            [KeyboardButton(text="📋 Мои аренды"), KeyboardButton(text="ℹ️ Помощь")],
+        ],
+        resize_keyboard=True
+    )
+
+
 # ------------------ БОТ ------------------
 
 storage = MemoryStorage()
@@ -403,7 +414,10 @@ async def cmd_start(message: Message, state: FSMContext):
         if bike_id:
             await start_bike_flow(message, state, bike_id)
         else:
-            await message.answer("С возвращением! 🙂\n\nКоманды:\n/rent — арендовать\n/my — мои аренды")
+            await message.answer(
+                "С возвращением! 🙂 Выберите действие в меню внизу.",
+                reply_markup=main_menu_kb()
+            )
         return
 
     if bike_id:
@@ -442,10 +456,8 @@ async def reg_passport(message: Message, state: FSMContext):
         await start_bike_flow(message, state, bike_id)
     else:
         await message.answer(
-            "Регистрация завершена! ✅\n\n"
-            "Команды:\n"
-            "/rent — арендовать велосипед\n"
-            "/my — мои аренды"
+            "Регистрация завершена! ✅ Выберите действие в меню внизу.",
+            reply_markup=main_menu_kb()
         )
 
 
@@ -460,6 +472,28 @@ async def start_bike_flow(message: Message, state: FSMContext, bike_id):
         await message.answer_photo(bike["photo_id"], caption=bike["name_model"])
     await message.answer(f"Велосипед: {bike['name_model']}\nНа какой срок?", reply_markup=period_keyboard(bike))
     await state.set_state(Rent.choosing_period)
+
+
+@router.message(F.text == "🚲 Арендовать велосипед")
+async def menu_rent(message: Message, state: FSMContext):
+    await cmd_rent(message, state)
+
+
+@router.message(F.text == "📋 Мои аренды")
+async def menu_my(message: Message):
+    await cmd_my(message)
+
+
+@router.message(F.text == "ℹ️ Помощь")
+async def menu_help(message: Message):
+    await message.answer(
+        "🚲 Как это работает:\n\n"
+        "1. Нажмите «Арендовать велосипед», выберите модель и срок\n"
+        "2. Заберите велосипед сами или закажите доставку (+500₽)\n"
+        "3. Переведите оплату и нажмите «Я оплатил(а)»\n"
+        "4. Когда закончите — нажмите «Вернуть велосипед» в разделе «Мои аренды»\n\n"
+        f"По всем вопросам: {BUSINESS_PHONE}"
+    )
 
 
 @router.message(Command("rent"))
@@ -1099,7 +1133,39 @@ async def check_maintenance():
             )
 
 
+async def setup_commands():
+    client_commands = [
+        BotCommand(command="start", description="Начать / регистрация"),
+        BotCommand(command="rent", description="Арендовать велосипед"),
+        BotCommand(command="my", description="Мои аренды"),
+    ]
+    await bot.set_my_commands(client_commands, scope=BotCommandScopeDefault())
+
+    admin_commands = client_commands + [
+        BotCommand(command="rentals", description="Активные аренды"),
+        BotCommand(command="paid", description="Отметить оплату (ID)"),
+        BotCommand(command="return", description="Закрыть аренду (ID)"),
+        BotCommand(command="expense", description="Записать расход"),
+        BotCommand(command="report", description="Финансовый отчёт"),
+        BotCommand(command="stats", description="Статистика"),
+        BotCommand(command="bike_history", description="История велосипеда (ID)"),
+        BotCommand(command="blacklist", description="Чёрный список"),
+        BotCommand(command="broadcast", description="Рассылка клиентам"),
+        BotCommand(command="set_photo", description="Добавить фото велосипеда"),
+        BotCommand(command="qr", description="QR-код велосипеда"),
+    ]
+    await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+
+    if FRIEND_ID:
+        friend_commands = [
+            BotCommand(command="start", description="Начать"),
+            BotCommand(command="report", description="Мой отчёт"),
+        ]
+        await bot.set_my_commands(friend_commands, scope=BotCommandScopeChat(chat_id=FRIEND_ID))
+
+
 async def main():
+    await setup_commands()
     scheduler = AsyncIOScheduler(timezone="Europe/Volgograd")
     scheduler.add_job(check_reminders, "cron", hour=10, minute=0)
     scheduler.add_job(check_maintenance, "cron", hour=10, minute=5)
