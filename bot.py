@@ -9,6 +9,9 @@ import gspread
 from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from contract import generate_contract_pdf, ru_date, extract_serial
+from datetime import date as date_cls
+
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -71,10 +74,16 @@ def ensure_all_columns():
     ensure_column(finances_ws, "bike_id")
     ensure_column(bikes_ws, "photo_id")
     ensure_column(clients_ws, "passport")
+    ensure_column(clients_ws, "passport_series")
+    ensure_column(clients_ws, "passport_number")
+    ensure_column(clients_ws, "registration_address")
+    ensure_column(clients_ws, "passport_photo_main")
+    ensure_column(clients_ws, "passport_photo_reg")
 
 
 ensure_all_columns()
 waiting_ws = ensure_worksheet("Ожидание", ["id", "telegram_id", "name", "date_added"])
+contracts_ws = ensure_worksheet("Договоры", ["id", "rental_id", "client_id", "date", "file_id"])
 
 # ------------------ ВЕЛОСИПЕДЫ ------------------
 
@@ -109,13 +118,17 @@ def set_bike_photo(bike_id, file_id):
 
 # ------------------ КЛИЕНТЫ ------------------
 
-def get_or_create_client(tg_id, name, phone, passport=""):
+def get_or_create_client(tg_id, name, phone, passport_series="", passport_number="",
+                          registration_address="", photo_main="", photo_reg=""):
     rows = clients_ws.get_all_records()
     for r in rows:
         if str(r.get("telegram_id")) == str(tg_id):
             return r.get("id")
     new_id = len(rows) + 1
-    clients_ws.append_row([new_id, tg_id, name, phone, datetime.now().strftime("%d.%m.%Y"), "нет", passport])
+    clients_ws.append_row([
+        new_id, tg_id, name, phone, datetime.now().strftime("%d.%m.%Y"), "нет", "",
+        passport_series, passport_number, registration_address, photo_main, photo_reg
+    ])
     return new_id
 
 
@@ -276,6 +289,20 @@ def get_bike_finances(bike_id):
     return [r for r in rows if str(r.get("bike_id")) == str(bike_id)]
 
 
+def log_contract(rental_id, client_id, file_id):
+    rows = contracts_ws.get_all_records()
+    new_id = len(rows) + 1
+    contracts_ws.append_row([new_id, rental_id, client_id, datetime.now().strftime("%d.%m.%Y"), file_id])
+
+
+def get_contract_by_rental(rental_id):
+    rows = contracts_ws.get_all_records()
+    for r in rows:
+        if str(r.get("rental_id")) == str(rental_id):
+            return r
+    return None
+
+
 def clear_sheet_keep_header(ws):
     headers = ws.row_values(1)
     ws.clear()
@@ -294,24 +321,7 @@ def reset_test_data():
 
 # ------------------ ДОГОВОР ------------------
 
-def generate_contract_text(rental_id, client_name, phone, passport, bike_name, period, price,
-                            start, end, delivery, delivery_address):
-    pickup = (f"доставка по адресу: {delivery_address}" if delivery == "да"
-              else f"самовывоз, {BUSINESS_ADDRESS}")
-    return (
-        f"📄 Договор аренды электровелосипеда №{rental_id}\n\n"
-        f"Арендатор: {client_name}, тел. {phone or '—'}\n"
-        f"Паспорт: {passport or '—'}\n"
-        f"Предмет аренды: {bike_name}\n"
-        f"Срок аренды: {period} (с {start} по {end})\n"
-        f"Стоимость: {price}₽\n"
-        f"Получение: {pickup}\n"
-        f"Контакт арендодателя: {BUSINESS_PHONE}\n\n"
-        f"Арендатор обязуется бережно эксплуатировать велосипед и вернуть его в исправном "
-        f"состоянии в указанный срок. В случае повреждения по вине арендатора стоимость "
-        f"ремонта оплачивается арендатором.\n\n"
-        f"Подтверждая аренду в боте, арендатор соглашается с условиями договора."
-    )
+# (текстовый договор заменён на PDF — см. contract.py)
 
 
 # ------------------ QR-КОД ------------------
@@ -397,6 +407,9 @@ class Registration(StatesGroup):
     waiting_name = State()
     waiting_phone = State()
     waiting_passport = State()
+    waiting_reg_address = State()
+    waiting_photo_main = State()
+    waiting_photo_reg = State()
 
 
 class Rent(StatesGroup):
@@ -469,16 +482,45 @@ async def reg_name(message: Message, state: FSMContext):
 async def reg_phone(message: Message, state: FSMContext):
     await state.update_data(phone=message.text)
     await message.answer(
-        "Спасибо! Теперь укажите серию и номер паспорта (нужно для договора аренды, "
-        "данные никому не передаются, кроме случаев поломки/спора)."
+        "Спасибо! Теперь укажите серию и номер паспорта одним сообщением "
+        "(например: 1234 567890)."
     )
     await state.set_state(Registration.waiting_passport)
 
 
 @router.message(Registration.waiting_passport)
 async def reg_passport(message: Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    series = parts[0] if parts else message.text
+    number = parts[1] if len(parts) > 1 else ""
+    await state.update_data(passport_series=series, passport_number=number)
+    await message.answer("Укажите адрес регистрации (прописку) как в паспорте:")
+    await state.set_state(Registration.waiting_reg_address)
+
+
+@router.message(Registration.waiting_reg_address)
+async def reg_address(message: Message, state: FSMContext):
+    await state.update_data(registration_address=message.text)
+    await message.answer("Пришлите фото главной страницы паспорта 📸")
+    await state.set_state(Registration.waiting_photo_main)
+
+
+@router.message(Registration.waiting_photo_main, F.photo)
+async def reg_photo_main(message: Message, state: FSMContext):
+    await state.update_data(photo_main=message.photo[-1].file_id)
+    await message.answer("Теперь пришлите фото страницы с пропиской 📸")
+    await state.set_state(Registration.waiting_photo_reg)
+
+
+@router.message(Registration.waiting_photo_reg, F.photo)
+async def reg_photo_reg(message: Message, state: FSMContext):
     data = await state.get_data()
-    get_or_create_client(message.from_user.id, data["name"], data["phone"], message.text)
+    get_or_create_client(
+        message.from_user.id, data["name"], data["phone"],
+        data.get("passport_series", ""), data.get("passport_number", ""),
+        data.get("registration_address", ""), data.get("photo_main", ""),
+        message.photo[-1].file_id
+    )
     bike_id = data.get("pending_bike_id")
     await state.clear()
     if bike_id:
@@ -582,6 +624,8 @@ async def menu_admin_help(message: Message):
         "  пример: /set_photo 3\n\n"
         "/qr ID_велика — получить QR-код для наклейки на велосипед\n"
         "  пример: /qr 3\n\n"
+        "/contract ID_аренды — заново получить PDF-договор по аренде\n"
+        "  пример: /contract 12\n\n"
         "— Автоматически, без команд —\n"
         "🔔 Уведомления о новых арендах, заявках на оплату и возврат приходят сами\n"
         "🔧 Напоминания о ТО — раз в неделю, если велик давно не обслуживался\n"
@@ -695,13 +739,30 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
 
     await bot.send_message(chat, "Управление бронью:", reply_markup=booking_buttons(rental_id))
 
-    contract = generate_contract_text(
-        rental_id, user.full_name, client["phone"] if client else "", client.get("passport", "") if client else "",
-        bike["name_model"], period, price,
-        start_dt.strftime("%d.%m.%Y"), end_dt.strftime("%d.%m.%Y"),
-        delivery, delivery_address
+    contract_data = {
+        "rental_id": rental_id,
+        "contract_date": ru_date(date_cls.today()),
+        "business_phone": BUSINESS_PHONE,
+        "full_name": user.full_name,
+        "passport_series": client.get("passport_series", "") if client else "",
+        "passport_number": client.get("passport_number", "") if client else "",
+        "registration_address": client.get("registration_address", "") if client else "",
+        "phone": client["phone"] if client else "",
+        "bike_name": bike["name_model"],
+        "serial": extract_serial(bike["name_model"]),
+        "start_date": start_dt.strftime("%d.%m.%Y"),
+        "end_date": end_dt.strftime("%d.%m.%Y"),
+        "price_week": bike["price_week"],
+        "price_month": bike["price_month"],
+        "daily_penalty": round(int(bike["price_week"]) / 7),
+    }
+    pdf_buf = generate_contract_pdf(contract_data)
+    sent_doc = await bot.send_document(
+        chat,
+        BufferedInputFile(pdf_buf.read(), filename=f"dogovor_{rental_id}.pdf"),
+        caption="📄 Договор аренды — ознакомьтесь перед встречей, подпишем при получении велосипеда"
     )
-    await bot.send_message(chat, contract)
+    log_contract(rental_id, client_id, sent_doc.document.file_id)
 
     await bot.send_message(
         ADMIN_ID,
@@ -1158,6 +1219,21 @@ async def confirm_reset(callback: CallbackQuery):
     )
 
 
+@router.message(Command("contract"))
+async def cmd_contract(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /contract ID_аренды")
+        return
+    contract = get_contract_by_rental(parts[1])
+    if not contract:
+        await message.answer("Договор для этой аренды не найден")
+        return
+    await message.answer_document(contract["file_id"], caption=f"Договор по аренде #{parts[1]}")
+
+
 @router.message(Command("qr"))
 async def cmd_qr(message: Message):
     if not admin_only(message.from_user.id):
@@ -1279,6 +1355,7 @@ async def setup_commands():
         BotCommand(command="broadcast", description="Рассылка клиентам"),
         BotCommand(command="set_photo", description="Добавить фото велосипеда"),
         BotCommand(command="qr", description="QR-код велосипеда"),
+        BotCommand(command="contract", description="Получить договор аренды (ID)"),
         BotCommand(command="reset_test", description="Очистить тестовые данные"),
     ]
     await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
