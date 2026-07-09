@@ -35,6 +35,7 @@ FRIEND_ID = int(_friend_env) if _friend_env else None
 BOT_USERNAME = "elektro_vlg_bot"
 BUSINESS_ADDRESS = "г. Волгоград, ул. Киргизская 2"
 BUSINESS_PHONE = "8-960-896-06-06"
+PAYMENT_INFO = "💳 Оплата на номер +7 995 404-39-63 (Сбербанк, Емикова Наталья Анатольевна)"
 DELIVERY_PRICE = 500
 TO_INTERVAL_DAYS = 30
 
@@ -79,6 +80,11 @@ def ensure_all_columns():
     ensure_column(clients_ws, "registration_address")
     ensure_column(clients_ws, "passport_photo_main")
     ensure_column(clients_ws, "passport_photo_reg")
+    ensure_column(clients_ws, "dob")
+    ensure_column(clients_ws, "passport_issued_by")
+    ensure_column(clients_ws, "passport_issue_date")
+    ensure_column(clients_ws, "department_code")
+    ensure_column(clients_ws, "actual_address")
 
 
 ensure_all_columns()
@@ -119,7 +125,9 @@ def set_bike_photo(bike_id, file_id):
 # ------------------ КЛИЕНТЫ ------------------
 
 def get_or_create_client(tg_id, name, phone, passport_series="", passport_number="",
-                          registration_address="", photo_main="", photo_reg=""):
+                          registration_address="", photo_main="", photo_reg="",
+                          dob="", issued_by="", issue_date="", department_code="",
+                          actual_address=""):
     rows = clients_ws.get_all_records()
     for r in rows:
         if str(r.get("telegram_id")) == str(tg_id):
@@ -127,7 +135,8 @@ def get_or_create_client(tg_id, name, phone, passport_series="", passport_number
     new_id = len(rows) + 1
     clients_ws.append_row([
         new_id, tg_id, name, phone, datetime.now().strftime("%d.%m.%Y"), "нет", "",
-        passport_series, passport_number, registration_address, photo_main, photo_reg
+        passport_series, passport_number, registration_address, photo_main, photo_reg,
+        dob, issued_by, issue_date, department_code, actual_address
     ])
     return new_id
 
@@ -406,8 +415,14 @@ dp.include_router(router)
 class Registration(StatesGroup):
     waiting_name = State()
     waiting_phone = State()
+    waiting_dob = State()
     waiting_passport = State()
+    waiting_issued_by = State()
+    waiting_issue_date = State()
+    waiting_department_code = State()
     waiting_reg_address = State()
+    waiting_actual_address_choice = State()
+    waiting_actual_address_text = State()
     waiting_photo_main = State()
     waiting_photo_reg = State()
 
@@ -481,9 +496,15 @@ async def reg_name(message: Message, state: FSMContext):
 @router.message(Registration.waiting_phone)
 async def reg_phone(message: Message, state: FSMContext):
     await state.update_data(phone=message.text)
+    await message.answer("Укажите дату рождения (например: 15.03.1990):")
+    await state.set_state(Registration.waiting_dob)
+
+
+@router.message(Registration.waiting_dob)
+async def reg_dob(message: Message, state: FSMContext):
+    await state.update_data(dob=message.text)
     await message.answer(
-        "Спасибо! Теперь укажите серию и номер паспорта одним сообщением "
-        "(например: 1234 567890)."
+        "Укажите серию и номер паспорта одним сообщением (например: 1234 567890):"
     )
     await state.set_state(Registration.waiting_passport)
 
@@ -494,6 +515,27 @@ async def reg_passport(message: Message, state: FSMContext):
     series = parts[0] if parts else message.text
     number = parts[1] if len(parts) > 1 else ""
     await state.update_data(passport_series=series, passport_number=number)
+    await message.answer("Кем выдан паспорт?")
+    await state.set_state(Registration.waiting_issued_by)
+
+
+@router.message(Registration.waiting_issued_by)
+async def reg_issued_by(message: Message, state: FSMContext):
+    await state.update_data(issued_by=message.text)
+    await message.answer("Дата выдачи паспорта (например: 20.05.2015):")
+    await state.set_state(Registration.waiting_issue_date)
+
+
+@router.message(Registration.waiting_issue_date)
+async def reg_issue_date(message: Message, state: FSMContext):
+    await state.update_data(issue_date=message.text)
+    await message.answer("Код подразделения (например: 340-001):")
+    await state.set_state(Registration.waiting_department_code)
+
+
+@router.message(Registration.waiting_department_code)
+async def reg_department_code(message: Message, state: FSMContext):
+    await state.update_data(department_code=message.text)
     await message.answer("Укажите адрес регистрации (прописку) как в паспорте:")
     await state.set_state(Registration.waiting_reg_address)
 
@@ -501,6 +543,34 @@ async def reg_passport(message: Message, state: FSMContext):
 @router.message(Registration.waiting_reg_address)
 async def reg_address(message: Message, state: FSMContext):
     await state.update_data(registration_address=message.text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, такой же", callback_data="actual_same")],
+        [InlineKeyboardButton(text="✏️ Другой адрес", callback_data="actual_diff")],
+    ])
+    await message.answer(
+        "Фактический адрес проживания такой же, как прописка?", reply_markup=kb
+    )
+    await state.set_state(Registration.waiting_actual_address_choice)
+
+
+@router.callback_query(F.data == "actual_same", Registration.waiting_actual_address_choice)
+async def reg_actual_same(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(actual_address=data.get("registration_address", ""))
+    await callback.message.edit_text("Принято ✅")
+    await callback.message.answer("Пришлите фото главной страницы паспорта 📸")
+    await state.set_state(Registration.waiting_photo_main)
+
+
+@router.callback_query(F.data == "actual_diff", Registration.waiting_actual_address_choice)
+async def reg_actual_diff(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите фактический адрес проживания:")
+    await state.set_state(Registration.waiting_actual_address_text)
+
+
+@router.message(Registration.waiting_actual_address_text)
+async def reg_actual_address_text(message: Message, state: FSMContext):
+    await state.update_data(actual_address=message.text)
     await message.answer("Пришлите фото главной страницы паспорта 📸")
     await state.set_state(Registration.waiting_photo_main)
 
@@ -519,7 +589,9 @@ async def reg_photo_reg(message: Message, state: FSMContext):
         message.from_user.id, data["name"], data["phone"],
         data.get("passport_series", ""), data.get("passport_number", ""),
         data.get("registration_address", ""), data.get("photo_main", ""),
-        message.photo[-1].file_id
+        message.photo[-1].file_id,
+        data.get("dob", ""), data.get("issued_by", ""), data.get("issue_date", ""),
+        data.get("department_code", ""), data.get("actual_address", "")
     )
     bike_id = data.get("pending_bike_id")
     await state.clear()
@@ -737,6 +809,7 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
         await event.answer(text)
         chat = event.chat.id
 
+    await bot.send_message(chat, PAYMENT_INFO)
     await bot.send_message(chat, "Управление бронью:", reply_markup=booking_buttons(rental_id))
 
     contract_data = {
@@ -744,9 +817,14 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
         "contract_date": ru_date(date_cls.today()),
         "business_phone": BUSINESS_PHONE,
         "full_name": client["name"] if client else user.full_name,
+        "dob": client.get("dob", "") if client else "",
         "passport_series": client.get("passport_series", "") if client else "",
         "passport_number": client.get("passport_number", "") if client else "",
+        "issued_by": client.get("passport_issued_by", "") if client else "",
+        "issue_date": client.get("passport_issue_date", "") if client else "",
+        "department_code": client.get("department_code", "") if client else "",
         "registration_address": client.get("registration_address", "") if client else "",
+        "actual_address": client.get("actual_address", "") if client else "",
         "phone": client["phone"] if client else "",
         "bike_name": bike["name_model"],
         "serial": extract_serial(bike["name_model"]),
@@ -880,7 +958,7 @@ async def extend_confirm(callback: CallbackQuery, state: FSMContext):
         f"До: {end_dt.strftime('%d.%m.%Y')}\n\n"
         f"Когда оплатите — нажмите кнопку ниже 👇"
     )
-    await callback.message.answer("Оплата за продление:", reply_markup=paid_button(new_id))
+    await callback.message.answer(f"Оплата за продление:\n{PAYMENT_INFO}", reply_markup=paid_button(new_id))
     await bot.send_message(
         ADMIN_ID,
         f"🔄 Продление: старая аренда #{old_rental_id} закрыта, новая #{new_id} "
@@ -1307,7 +1385,7 @@ async def check_reminders():
                 await bot.send_message(
                     tg_id,
                     f"🔴 У вас долг по аренде #{r['id']}: {r['amount']}₽, просрочено с {r['end_date']}. "
-                    f"Пожалуйста, оплатите или свяжитесь с нами: {BUSINESS_PHONE}",
+                    f"Пожалуйста, оплатите или свяжитесь с нами: {BUSINESS_PHONE}\n\n{PAYMENT_INFO}",
                     reply_markup=paid_button(r["id"])
                 )
 
