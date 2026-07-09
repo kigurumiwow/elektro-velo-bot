@@ -373,6 +373,17 @@ def main_menu_kb():
     )
 
 
+def admin_menu_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Активные аренды"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="💰 Отчёт"), KeyboardButton(text="🧹 Сброс теста")],
+            [KeyboardButton(text="❓ Все команды")],
+        ],
+        resize_keyboard=True
+    )
+
+
 # ------------------ БОТ ------------------
 
 storage = MemoryStorage()
@@ -429,6 +440,8 @@ async def cmd_start(message: Message, state: FSMContext):
     if client:
         if bike_id:
             await start_bike_flow(message, state, bike_id)
+        elif message.from_user.id == ADMIN_ID:
+            await message.answer("Привет! Админ-панель ниже 👇", reply_markup=admin_menu_kb())
         else:
             await message.answer(
                 "С возвращением! 🙂 Выберите действие в меню внизу.",
@@ -509,6 +522,70 @@ async def menu_help(message: Message):
         "3. Переведите оплату и нажмите «Я оплатил(а)»\n"
         "4. Когда закончите — нажмите «Вернуть велосипед» в разделе «Мои аренды»\n\n"
         f"По всем вопросам: {BUSINESS_PHONE}"
+    )
+
+
+@router.message(Command("admin"))
+async def cmd_admin_menu(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Админ-панель:", reply_markup=admin_menu_kb())
+
+
+@router.message(F.text == "📋 Активные аренды")
+async def menu_admin_rentals(message: Message):
+    await cmd_rentals(message)
+
+
+@router.message(F.text == "📊 Статистика")
+async def menu_admin_stats(message: Message):
+    await cmd_stats(message)
+
+
+@router.message(F.text == "💰 Отчёт")
+async def menu_admin_report(message: Message):
+    await cmd_report(message)
+
+
+@router.message(F.text == "🧹 Сброс теста")
+async def menu_admin_reset(message: Message):
+    await cmd_reset_test(message)
+
+
+@router.message(F.text == "❓ Все команды")
+async def menu_admin_help(message: Message):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer(
+        "📖 Все команды администратора\n\n"
+        "— Без параметров (есть кнопки) —\n"
+        "/rentals — список активных аренд\n"
+        "/stats — статистика (велики, клиенты, доход за сегодня)\n"
+        "/report — финансовый отчёт (доход/расход, я и Денц)\n"
+        "/reset_test — очистить тестовые данные (с подтверждением)\n\n"
+        "— С параметрами (наберите вручную) —\n"
+        "/paid ID_аренды — вручную отметить аренду оплаченной\n"
+        "  пример: /paid 5\n\n"
+        "/return ID_аренды — вручную закрыть аренду, освободить велик\n"
+        "  пример: /return 5\n\n"
+        "/expense Владелец ID_велика Сумма Категория Комментарий\n"
+        "  Владелец: Я или Денц. ID_велика: число, или - если расход общий\n"
+        "  пример: /expense Я 3 1500 ремонт замена камеры\n\n"
+        "/bike_history ID_велика — история аренд и расходов по велику\n"
+        "  пример: /bike_history 3\n\n"
+        "/blacklist add ID_клиента — добавить в чёрный список\n"
+        "/blacklist remove ID_клиента — убрать из чёрного списка\n"
+        "  пример: /blacklist add 7\n\n"
+        "/broadcast текст — разослать сообщение всем клиентам\n"
+        "  пример: /broadcast Завтра не работаем, извините за неудобства\n\n"
+        "/set_photo ID_велика — затем прислать фото следующим сообщением\n"
+        "  пример: /set_photo 3\n\n"
+        "/qr ID_велика — получить QR-код для наклейки на велосипед\n"
+        "  пример: /qr 3\n\n"
+        "— Автоматически, без команд —\n"
+        "🔔 Уведомления о новых арендах, заявках на оплату и возврат приходят сами\n"
+        "🔧 Напоминания о ТО — раз в неделю, если велик давно не обслуживался\n"
+        "🔴 Напоминания о просрочках — приходят автоматически вам и клиенту"
     )
 
 
@@ -1190,6 +1267,7 @@ async def setup_commands():
     await bot.set_my_commands(client_commands, scope=BotCommandScopeDefault())
 
     admin_commands = client_commands + [
+        BotCommand(command="admin", description="Открыть админ-панель"),
         BotCommand(command="rentals", description="Активные аренды"),
         BotCommand(command="paid", description="Отметить оплату (ID)"),
         BotCommand(command="return", description="Закрыть аренду (ID)"),
