@@ -464,6 +464,90 @@ async def recognize_passport(bot_instance, photo_main_id, photo_reg_id):
         return None
 
 
+FIELD_LABELS = [
+    ("full_name", "ФИО"),
+    ("dob", "Дата рождения"),
+    ("passport_series", "Серия паспорта"),
+    ("passport_number", "Номер паспорта"),
+    ("issued_by", "Кем выдан"),
+    ("issue_date", "Дата выдачи"),
+    ("department_code", "Код подразделения"),
+    ("registration_address", "Адрес регистрации"),
+]
+
+
+def recognition_summary_text(rec):
+    lines = ["Распознано:\n"]
+    for key, label in FIELD_LABELS:
+        lines.append(f"{label}: {rec.get(key) or '—'}")
+    lines.append("\nВсё верно?")
+    return "\n".join(lines)
+
+
+def recognition_kb(prefix):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Всё верно", callback_data=f"{prefix}_recog_ok")],
+        [InlineKeyboardButton(text="✏️ Исправить поле", callback_data=f"{prefix}_edit_menu")],
+        [InlineKeyboardButton(text="📝 Заполнить всё вручную", callback_data=f"{prefix}_recog_manual")],
+    ])
+
+
+def edit_menu_kb(prefix, rec):
+    buttons = [
+        [InlineKeyboardButton(text=f"{label}: {rec.get(key) or '—'}", callback_data=f"{prefix}_editfield_{key}")]
+        for key, label in FIELD_LABELS
+    ]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{prefix}_edit_back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+class EditField(StatesGroup):
+    waiting_value = State()
+
+
+@router.callback_query(F.data.endswith("_edit_menu"))
+async def show_edit_menu(callback: CallbackQuery, state: FSMContext):
+    prefix = callback.data.split("_edit_menu")[0]
+    data = await state.get_data()
+    rec = data.get("recognized", {})
+    await callback.message.edit_text("Какое поле исправить?", reply_markup=edit_menu_kb(prefix, rec))
+
+
+@router.callback_query(F.data.endswith("_edit_back"))
+async def edit_back(callback: CallbackQuery, state: FSMContext):
+    prefix = callback.data.split("_edit_back")[0]
+    data = await state.get_data()
+    rec = data.get("recognized", {})
+    await callback.message.edit_text(recognition_summary_text(rec), reply_markup=recognition_kb(prefix))
+
+
+@router.callback_query(F.data.contains("_editfield_"))
+async def edit_field_prompt(callback: CallbackQuery, state: FSMContext):
+    prefix, field_key = callback.data.split("_editfield_")
+    await state.update_data(
+        edit_prefix=prefix, edit_field=field_key,
+        edit_return_state="registration" if prefix == "reg" else "add_client"
+    )
+    label = dict(FIELD_LABELS).get(field_key, field_key)
+    await callback.message.edit_text(f"Введите новое значение для «{label}»:")
+    await state.set_state(EditField.waiting_value)
+
+
+@router.message(EditField.waiting_value)
+async def edit_field_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    field_key = data.get("edit_field")
+    prefix = data.get("edit_prefix")
+    rec = data.get("recognized", {})
+    rec[field_key] = message.text
+    await state.update_data(recognized=rec)
+    if data.get("edit_return_state") == "registration":
+        await state.set_state(Registration.confirming_recognition)
+    else:
+        await state.set_state(AddClient.confirming_recognition)
+    await message.answer(recognition_summary_text(rec), reply_markup=recognition_kb(prefix))
+
+
 def period_keyboard(bike, prefix="period_"):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data=f"{prefix}неделя")],
@@ -636,22 +720,7 @@ async def reg_photo_reg(message: Message, state: FSMContext):
 
     if recognized:
         await state.update_data(recognized=recognized)
-        text = (
-            "Вот что удалось распознать:\n\n"
-            f"ФИО: {recognized.get('full_name') or '—'}\n"
-            f"Дата рождения: {recognized.get('dob') or '—'}\n"
-            f"Паспорт: {recognized.get('passport_series') or '—'} {recognized.get('passport_number') or ''}\n"
-            f"Кем выдан: {recognized.get('issued_by') or '—'}\n"
-            f"Дата выдачи: {recognized.get('issue_date') or '—'}\n"
-            f"Код подразделения: {recognized.get('department_code') or '—'}\n"
-            f"Адрес регистрации: {recognized.get('registration_address') or '—'}\n\n"
-            "Всё верно?"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Всё верно", callback_data="recog_ok")],
-            [InlineKeyboardButton(text="✏️ Заполнить вручную", callback_data="recog_manual")],
-        ])
-        await message.answer(text, reply_markup=kb)
+        await message.answer(recognition_summary_text(recognized), reply_markup=recognition_kb("reg"))
         await state.set_state(Registration.confirming_recognition)
     else:
         if openai_client:
@@ -660,7 +729,7 @@ async def reg_photo_reg(message: Message, state: FSMContext):
         await state.set_state(Registration.waiting_dob)
 
 
-@router.callback_query(F.data == "recog_ok", Registration.confirming_recognition)
+@router.callback_query(F.data == "reg_recog_ok", Registration.confirming_recognition)
 async def recog_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     rec = data.get("recognized", {})
@@ -678,7 +747,7 @@ async def recog_confirm(callback: CallbackQuery, state: FSMContext):
     await ask_actual_address(callback.message, state)
 
 
-@router.callback_query(F.data == "recog_manual", Registration.confirming_recognition)
+@router.callback_query(F.data == "reg_recog_manual", Registration.confirming_recognition)
 async def recog_manual(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Хорошо, заполним вручную.")
     await callback.message.answer("Укажите дату рождения (например: 15.03.1990):")
@@ -1484,22 +1553,7 @@ async def ac_photo_reg(message: Message, state: FSMContext):
 
     if recognized:
         await state.update_data(recognized=recognized)
-        text = (
-            "Распознано:\n\n"
-            f"ФИО: {recognized.get('full_name') or '—'}\n"
-            f"Дата рождения: {recognized.get('dob') or '—'}\n"
-            f"Паспорт: {recognized.get('passport_series') or '—'} {recognized.get('passport_number') or ''}\n"
-            f"Кем выдан: {recognized.get('issued_by') or '—'}\n"
-            f"Дата выдачи: {recognized.get('issue_date') or '—'}\n"
-            f"Код подразделения: {recognized.get('department_code') or '—'}\n"
-            f"Адрес регистрации: {recognized.get('registration_address') or '—'}\n\n"
-            "Всё верно?"
-        )
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Всё верно", callback_data="ac_recog_ok")],
-            [InlineKeyboardButton(text="✏️ Заполнить вручную", callback_data="ac_recog_manual")],
-        ])
-        await message.answer(text, reply_markup=kb)
+        await message.answer(recognition_summary_text(recognized), reply_markup=recognition_kb("ac"))
         await state.set_state(AddClient.confirming_recognition)
     else:
         await message.answer("Укажите дату рождения (например: 15.03.1990):")
