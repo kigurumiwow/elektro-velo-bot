@@ -164,6 +164,44 @@ def get_client_telegram_id(client_id):
     return None
 
 
+def get_client_by_id(client_id):
+    rows = clients_ws.get_all_records()
+    for r in rows:
+        if str(r.get("id")) == str(client_id):
+            return r
+    return None
+
+
+def is_manual_tg_id(tg_id):
+    return str(tg_id).startswith("manual_")
+
+
+def next_manual_id():
+    rows = clients_ws.get_all_records()
+    manual_count = len([r for r in rows if is_manual_tg_id(r.get("telegram_id", ""))])
+    return f"manual_{manual_count + 1}"
+
+
+def create_manual_client(name, phone, passport_series="", passport_number="",
+                          registration_address="", photo_main="", photo_reg="",
+                          dob="", issued_by="", issue_date="", department_code="",
+                          actual_address=""):
+    rows = clients_ws.get_all_records()
+    new_id = len(rows) + 1
+    tg_id = next_manual_id()
+    clients_ws.append_row([
+        new_id, tg_id, name, phone, datetime.now().strftime("%d.%m.%Y"), "нет", "",
+        passport_series, passport_number, registration_address, photo_main, photo_reg,
+        dob, issued_by, issue_date, department_code, actual_address
+    ])
+    return new_id, tg_id
+
+
+def get_manual_clients():
+    rows = clients_ws.get_all_records()
+    return [r for r in rows if is_manual_tg_id(r.get("telegram_id", ""))]
+
+
 def is_blacklisted(client_id):
     rows = clients_ws.get_all_records()
     for r in rows:
@@ -494,6 +532,28 @@ class SetPhoto(StatesGroup):
     waiting_photo = State()
 
 
+class AddClient(StatesGroup):
+    waiting_name = State()
+    waiting_phone = State()
+    waiting_photo_main = State()
+    waiting_photo_reg = State()
+    confirming_recognition = State()
+    waiting_dob = State()
+    waiting_passport = State()
+    waiting_issued_by = State()
+    waiting_issue_date = State()
+    waiting_department_code = State()
+    waiting_reg_address = State()
+    waiting_actual_address_choice = State()
+    waiting_actual_address_text = State()
+
+
+class ManualRent(StatesGroup):
+    choosing_client = State()
+    choosing_bike = State()
+    choosing_period = State()
+
+
 class ReturnFlow(StatesGroup):
     waiting_photo = State()
 
@@ -710,6 +770,13 @@ async def finalize_registration(target: Message, user_id: int, state: FSMContext
         data.get("dob", ""), data.get("issued_by", ""), data.get("issue_date", ""),
         data.get("department_code", ""), data.get("actual_address", "")
     )
+    if data.get("photo_main"):
+        await bot.send_photo(
+            ADMIN_ID, data["photo_main"],
+            caption=f"🪪 Паспорт нового клиента: {data.get('name', '—')}, тел. {data.get('phone', '—')}"
+        )
+    if data.get("photo_reg"):
+        await bot.send_photo(ADMIN_ID, data["photo_reg"], caption="🪪 Страница с пропиской")
     bike_id = data.get("pending_bike_id")
     await state.clear()
     if bike_id:
@@ -815,6 +882,8 @@ async def menu_admin_help(message: Message):
         "  пример: /qr 3\n\n"
         "/contract ID_аренды — заново получить PDF-договор по аренде\n"
         "  пример: /contract 12\n\n"
+        "/add_client — добавить клиента без Telegram (пошагово, с фото паспорта)\n\n"
+        "/manual_rent — оформить аренду для клиента без Telegram (выбор кнопками)\n\n"
         "— Автоматически, без команд —\n"
         "🔔 Уведомления о новых арендах, заявках на оплату и возврат приходят сами\n"
         "🔧 Напоминания о ТО — раз в неделю, если велик давно не обслуживался\n"
@@ -952,12 +1021,18 @@ async def finalize_rental(event, state: FSMContext, delivery, delivery_address):
         "daily_penalty": round(int(bike["price_week"]) / 7),
     }
     pdf_buf = generate_contract_pdf(contract_data)
+    pdf_bytes = pdf_buf.read()
     sent_doc = await bot.send_document(
         chat,
-        BufferedInputFile(pdf_buf.read(), filename=f"dogovor_{rental_id}.pdf"),
+        BufferedInputFile(pdf_bytes, filename=f"dogovor_{rental_id}.pdf"),
         caption="📄 Договор аренды — ознакомьтесь перед встречей, подпишем при получении велосипеда"
     )
     log_contract(rental_id, client_id, sent_doc.document.file_id)
+    await bot.send_document(
+        ADMIN_ID,
+        BufferedInputFile(pdf_bytes, filename=f"dogovor_{rental_id}.pdf"),
+        caption=f"📄 Копия договора #{rental_id} — можно распечатать"
+    )
 
     await bot.send_message(
         ADMIN_ID,
@@ -1026,7 +1101,7 @@ async def confirm_paid(callback: CallbackQuery):
     add_income(rental_id, rental["amount"], rental["owner"], rental["bike_id"])
     await callback.message.edit_text(callback.message.text + "\n\n✅ Оплата подтверждена")
     tg_id = get_client_telegram_id(rental["client_id"])
-    if tg_id:
+    if tg_id and not is_manual_tg_id(tg_id):
         await bot.send_message(tg_id, f"Оплата по аренде #{rental_id} подтверждена ✅ Спасибо!")
 
 
@@ -1040,7 +1115,7 @@ async def reject_paid(callback: CallbackQuery):
     set_payment_status(rental_id, "не оплачено")
     await callback.message.edit_text(callback.message.text + "\n\n❌ Отклонено")
     tg_id = get_client_telegram_id(rental["client_id"])
-    if tg_id:
+    if tg_id and not is_manual_tg_id(tg_id):
         await bot.send_message(tg_id, f"По аренде #{rental_id} мы не нашли поступление оплаты. Свяжитесь с нами.")
 
 
@@ -1126,7 +1201,7 @@ async def confirm_return(callback: CallbackQuery):
     mark_returned(rental_id)
     await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ Возврат подтверждён")
     tg_id = get_client_telegram_id(rental["client_id"])
-    if tg_id:
+    if tg_id and not is_manual_tg_id(tg_id):
         await bot.send_message(tg_id, f"Возврат велосипеда по аренде #{rental_id} подтверждён, спасибо! 🚲")
     await notify_and_clear_waitlist()
 
@@ -1353,6 +1428,295 @@ async def cmd_broadcast(message: Message):
     await message.answer(f"Разослано {sent} клиентам")
 
 
+@router.message(Command("add_client"))
+async def cmd_add_client(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+    await message.answer("Добавляем клиента без Telegram.\n\nФ.И.О. клиента:")
+    await state.set_state(AddClient.waiting_name)
+
+
+@router.message(AddClient.waiting_name)
+async def ac_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Номер телефона:")
+    await state.set_state(AddClient.waiting_phone)
+
+
+@router.message(AddClient.waiting_phone)
+async def ac_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Пропустить фото", callback_data="ac_skip_photos")]
+    ])
+    await message.answer("Пришлите фото главной страницы паспорта 📸 (или пропустите)", reply_markup=kb)
+    await state.set_state(AddClient.waiting_photo_main)
+
+
+@router.callback_query(F.data == "ac_skip_photos", AddClient.waiting_photo_main)
+async def ac_skip_photos(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Фото пропущены.")
+    await callback.message.answer("Укажите дату рождения (например: 15.03.1990), или «-» если нет данных:")
+    await state.set_state(AddClient.waiting_dob)
+
+
+@router.message(AddClient.waiting_photo_main, F.photo)
+async def ac_photo_main(message: Message, state: FSMContext):
+    await state.update_data(photo_main=message.photo[-1].file_id)
+    await message.answer("Теперь фото страницы с пропиской 📸")
+    await state.set_state(AddClient.waiting_photo_reg)
+
+
+@router.message(AddClient.waiting_photo_reg, F.photo)
+async def ac_photo_reg(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photo_reg_id = message.photo[-1].file_id
+    await state.update_data(photo_reg=photo_reg_id)
+
+    recognized = None
+    if openai_client:
+        wait_msg = await message.answer("Распознаю паспорт, секунду... ⏳")
+        recognized = await recognize_passport(message.bot, data["photo_main"], photo_reg_id)
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
+    if recognized:
+        await state.update_data(recognized=recognized)
+        text = (
+            "Распознано:\n\n"
+            f"ФИО: {recognized.get('full_name') or '—'}\n"
+            f"Дата рождения: {recognized.get('dob') or '—'}\n"
+            f"Паспорт: {recognized.get('passport_series') or '—'} {recognized.get('passport_number') or ''}\n"
+            f"Кем выдан: {recognized.get('issued_by') or '—'}\n"
+            f"Дата выдачи: {recognized.get('issue_date') or '—'}\n"
+            f"Код подразделения: {recognized.get('department_code') or '—'}\n"
+            f"Адрес регистрации: {recognized.get('registration_address') or '—'}\n\n"
+            "Всё верно?"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Всё верно", callback_data="ac_recog_ok")],
+            [InlineKeyboardButton(text="✏️ Заполнить вручную", callback_data="ac_recog_manual")],
+        ])
+        await message.answer(text, reply_markup=kb)
+        await state.set_state(AddClient.confirming_recognition)
+    else:
+        await message.answer("Укажите дату рождения (например: 15.03.1990):")
+        await state.set_state(AddClient.waiting_dob)
+
+
+@router.callback_query(F.data == "ac_recog_ok", AddClient.confirming_recognition)
+async def ac_recog_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    rec = data.get("recognized", {})
+    await state.update_data(
+        name=rec.get("full_name") or data.get("name"),
+        dob=rec.get("dob", ""), passport_series=rec.get("passport_series", ""),
+        passport_number=rec.get("passport_number", ""), issued_by=rec.get("issued_by", ""),
+        issue_date=rec.get("issue_date", ""), department_code=rec.get("department_code", ""),
+        registration_address=rec.get("registration_address", "")
+    )
+    await callback.message.edit_text("Принято ✅")
+    await ac_ask_actual_address(callback.message, state)
+
+
+@router.callback_query(F.data == "ac_recog_manual", AddClient.confirming_recognition)
+async def ac_recog_manual(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Заполним вручную.")
+    await callback.message.answer("Укажите дату рождения (например: 15.03.1990):")
+    await state.set_state(AddClient.waiting_dob)
+
+
+@router.message(AddClient.waiting_dob)
+async def ac_dob(message: Message, state: FSMContext):
+    await state.update_data(dob=message.text)
+    await message.answer("Серия и номер паспорта одним сообщением (например: 1234 567890):")
+    await state.set_state(AddClient.waiting_passport)
+
+
+@router.message(AddClient.waiting_passport)
+async def ac_passport(message: Message, state: FSMContext):
+    parts = message.text.split(maxsplit=1)
+    series = parts[0] if parts else message.text
+    number = parts[1] if len(parts) > 1 else ""
+    await state.update_data(passport_series=series, passport_number=number)
+    await message.answer("Кем выдан паспорт?")
+    await state.set_state(AddClient.waiting_issued_by)
+
+
+@router.message(AddClient.waiting_issued_by)
+async def ac_issued_by(message: Message, state: FSMContext):
+    await state.update_data(issued_by=message.text)
+    await message.answer("Дата выдачи паспорта:")
+    await state.set_state(AddClient.waiting_issue_date)
+
+
+@router.message(AddClient.waiting_issue_date)
+async def ac_issue_date(message: Message, state: FSMContext):
+    await state.update_data(issue_date=message.text)
+    await message.answer("Код подразделения:")
+    await state.set_state(AddClient.waiting_department_code)
+
+
+@router.message(AddClient.waiting_department_code)
+async def ac_department_code(message: Message, state: FSMContext):
+    await state.update_data(department_code=message.text)
+    await message.answer("Адрес регистрации (прописка):")
+    await state.set_state(AddClient.waiting_reg_address)
+
+
+@router.message(AddClient.waiting_reg_address)
+async def ac_reg_address(message: Message, state: FSMContext):
+    await state.update_data(registration_address=message.text)
+    await ac_ask_actual_address(message, state)
+
+
+async def ac_ask_actual_address(target, state: FSMContext):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, такой же", callback_data="ac_actual_same")],
+        [InlineKeyboardButton(text="✏️ Другой адрес", callback_data="ac_actual_diff")],
+    ])
+    await target.answer("Фактический адрес такой же, как прописка?", reply_markup=kb)
+    await state.set_state(AddClient.waiting_actual_address_choice)
+
+
+@router.callback_query(F.data == "ac_actual_same", AddClient.waiting_actual_address_choice)
+async def ac_actual_same(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(actual_address=data.get("registration_address", ""))
+    await callback.message.edit_text("Принято ✅")
+    await ac_finalize(callback.message, state)
+
+
+@router.callback_query(F.data == "ac_actual_diff", AddClient.waiting_actual_address_choice)
+async def ac_actual_diff(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите фактический адрес:")
+    await state.set_state(AddClient.waiting_actual_address_text)
+
+
+@router.message(AddClient.waiting_actual_address_text)
+async def ac_actual_address_text(message: Message, state: FSMContext):
+    await state.update_data(actual_address=message.text)
+    await ac_finalize(message, state)
+
+
+async def ac_finalize(target: Message, state: FSMContext):
+    data = await state.get_data()
+    client_id, tg_id = create_manual_client(
+        data.get("name"), data.get("phone"),
+        data.get("passport_series", ""), data.get("passport_number", ""),
+        data.get("registration_address", ""), data.get("photo_main", ""),
+        data.get("photo_reg", ""), data.get("dob", ""), data.get("issued_by", ""),
+        data.get("issue_date", ""), data.get("department_code", ""),
+        data.get("actual_address", "")
+    )
+    await state.clear()
+    await target.answer(
+        f"✅ Клиент добавлен (id {client_id}): {data.get('name')}, тел. {data.get('phone')}\n\n"
+        f"Теперь можно оформить аренду командой /manual_rent"
+    )
+
+
+@router.message(Command("manual_rent"))
+async def cmd_manual_rent(message: Message, state: FSMContext):
+    if not admin_only(message.from_user.id):
+        return
+    clients = get_manual_clients()
+    if not clients:
+        await message.answer("Нет клиентов без Telegram. Сначала добавьте через /add_client")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{c['name']} ({c['phone']})", callback_data=f"manrent_client_{c['id']}")]
+        for c in clients
+    ])
+    await message.answer("Выберите клиента:", reply_markup=kb)
+    await state.set_state(ManualRent.choosing_client)
+
+
+@router.callback_query(F.data.startswith("manrent_client_"), ManualRent.choosing_client)
+async def manrent_choose_client(callback: CallbackQuery, state: FSMContext):
+    client_id = callback.data.split("_")[-1]
+    await state.update_data(manual_client_id=client_id)
+    free_bikes = get_free_bikes()
+    if not free_bikes:
+        await callback.message.edit_text("Сейчас нет свободных велосипедов.")
+        await state.clear()
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=b["name_model"], callback_data=f"manrent_bike_{b['id']}")]
+        for b in free_bikes
+    ])
+    await callback.message.edit_text("Выберите велосипед:", reply_markup=kb)
+    await state.set_state(ManualRent.choosing_bike)
+
+
+@router.callback_query(F.data.startswith("manrent_bike_"), ManualRent.choosing_bike)
+async def manrent_choose_bike(callback: CallbackQuery, state: FSMContext):
+    bike_id = callback.data.split("_")[-1]
+    bike, _ = get_bike_by_id(bike_id)
+    await state.update_data(manual_bike_id=bike_id)
+    await callback.message.edit_text(
+        f"Велосипед: {bike['name_model']}\nНа какой срок?",
+        reply_markup=period_keyboard(bike, prefix="manrent_period_")
+    )
+    await state.set_state(ManualRent.choosing_period)
+
+
+@router.callback_query(F.data.startswith("manrent_period_"), ManualRent.choosing_period)
+async def manrent_finalize(callback: CallbackQuery, state: FSMContext):
+    period = callback.data.split("_")[-1]
+    data = await state.get_data()
+    bike_id = data["manual_bike_id"]
+    client_id = data["manual_client_id"]
+    bike, _ = get_bike_by_id(bike_id)
+    price = int(bike["price_week"] if period == "неделя" else bike["price_month"])
+    client = get_client_by_id(client_id)
+
+    rental_id, start_dt, end_dt = create_rental(bike_id, client_id, period, price, bike["owner"])
+
+    contract_data = {
+        "rental_id": rental_id,
+        "contract_date": ru_date(date_cls.today()),
+        "business_phone": BUSINESS_PHONE,
+        "full_name": client["name"],
+        "dob": client.get("dob", ""),
+        "passport_series": client.get("passport_series", ""),
+        "passport_number": client.get("passport_number", ""),
+        "issued_by": client.get("passport_issued_by", ""),
+        "issue_date": client.get("passport_issue_date", ""),
+        "department_code": client.get("department_code", ""),
+        "registration_address": client.get("registration_address", ""),
+        "actual_address": client.get("actual_address", ""),
+        "phone": client.get("phone", ""),
+        "bike_name": bike["name_model"],
+        "serial": extract_serial(bike["name_model"]),
+        "start_date": start_dt.strftime("%d.%m.%Y"),
+        "end_date": end_dt.strftime("%d.%m.%Y"),
+        "price_week": bike["price_week"],
+        "price_month": bike["price_month"],
+        "daily_penalty": round(int(bike["price_week"]) / 7),
+    }
+    pdf_buf = generate_contract_pdf(contract_data)
+    sent_doc = await bot.send_document(
+        ADMIN_ID,
+        BufferedInputFile(pdf_buf.read(), filename=f"dogovor_{rental_id}.pdf"),
+        caption=f"📄 Договор аренды #{rental_id} (клиент без Telegram) — распечатайте для подписи"
+    )
+    log_contract(rental_id, client_id, sent_doc.document.file_id)
+
+    await callback.message.edit_text(
+        f"✅ Аренда #{rental_id} создана\n\n"
+        f"Клиент: {client['name']}\n"
+        f"Велосипед: {bike['name_model']}\n"
+        f"Срок: {period}, сумма: {price}₽\n"
+        f"До: {end_dt.strftime('%d.%m.%Y')}\n\n"
+        f"Когда получите оплату — отметьте: /paid {rental_id}\n"
+        f"Когда велосипед вернут — закройте: /return {rental_id}"
+    )
+    await state.clear()
+
+
 @router.message(Command("set_photo"))
 async def cmd_set_photo(message: Message, state: FSMContext):
     if not admin_only(message.from_user.id):
@@ -1477,28 +1841,34 @@ async def check_reminders():
             continue
         days_left = (end_date - today).days
         tg_id = get_client_telegram_id(r["client_id"])
-        if not tg_id:
-            continue
+        client_reachable = bool(tg_id) and not is_manual_tg_id(tg_id)
         unpaid = r.get("payment_status") != "оплачено"
         if days_left == 1:
-            await bot.send_message(
-                tg_id,
-                f"⏰ Завтра ({r['end_date']}) заканчивается аренда (сумма {r['amount']}₽).",
-                reply_markup=rental_action_buttons(r["id"], unpaid)
-            )
+            if client_reachable:
+                await bot.send_message(
+                    tg_id,
+                    f"⏰ Завтра ({r['end_date']}) заканчивается аренда (сумма {r['amount']}₽).",
+                    reply_markup=rental_action_buttons(r["id"], unpaid)
+                )
+            else:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⏰ Клиент без Telegram: завтра ({r['end_date']}) заканчивается аренда #{r['id']}"
+                )
         elif days_left == 0:
-            await bot.send_message(
-                tg_id,
-                "⚠️ Сегодня последний день аренды. Продлите или верните велосипед.",
-                reply_markup=rental_action_buttons(r["id"], unpaid)
-            )
+            if client_reachable:
+                await bot.send_message(
+                    tg_id,
+                    "⚠️ Сегодня последний день аренды. Продлите или верните велосипед.",
+                    reply_markup=rental_action_buttons(r["id"], unpaid)
+                )
             await bot.send_message(ADMIN_ID, f"⚠️ Сегодня истекает аренда #{r['id']}")
         elif days_left < 0:
             await bot.send_message(
                 ADMIN_ID,
                 f"🔴 Просрочка! Аренда #{r['id']} истекла {r['end_date']}, оплата: {r['payment_status']}"
             )
-            if unpaid:
+            if unpaid and client_reachable:
                 await bot.send_message(
                     tg_id,
                     f"🔴 У вас долг по аренде #{r['id']}: {r['amount']}₽, просрочено с {r['end_date']}. "
@@ -1551,6 +1921,8 @@ async def setup_commands():
         BotCommand(command="set_photo", description="Добавить фото велосипеда"),
         BotCommand(command="qr", description="QR-код велосипеда"),
         BotCommand(command="contract", description="Получить договор аренды (ID)"),
+        BotCommand(command="add_client", description="Добавить клиента без Telegram"),
+        BotCommand(command="manual_rent", description="Оформить аренду вручную"),
         BotCommand(command="reset_test", description="Очистить тестовые данные"),
     ]
     await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
