@@ -464,6 +464,45 @@ async def recognize_passport(bot_instance, photo_main_id, photo_reg_id):
         return None
 
 
+
+
+def period_keyboard(bike, prefix="period_"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data=f"{prefix}неделя")],
+        [InlineKeyboardButton(text=f"Месяц — {bike['price_month']}₽", callback_data=f"{prefix}месяц")],
+    ])
+
+
+def main_menu_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🚲 Арендовать велосипед")],
+            [KeyboardButton(text="📋 Мои аренды"), KeyboardButton(text="ℹ️ Помощь")],
+        ],
+        resize_keyboard=True
+    )
+
+
+def admin_menu_kb():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📋 Активные аренды"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="💰 Отчёт"), KeyboardButton(text="🧹 Сброс теста")],
+            [KeyboardButton(text="❓ Все команды")],
+        ],
+        resize_keyboard=True
+    )
+
+
+# ------------------ БОТ ------------------
+
+storage = MemoryStorage()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=storage)
+router = Router()
+dp.include_router(router)
+
+
 FIELD_LABELS = [
     ("full_name", "ФИО"),
     ("dob", "Дата рождения"),
@@ -546,43 +585,6 @@ async def edit_field_value(message: Message, state: FSMContext):
     else:
         await state.set_state(AddClient.confirming_recognition)
     await message.answer(recognition_summary_text(rec), reply_markup=recognition_kb(prefix))
-
-
-def period_keyboard(bike, prefix="period_"):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Неделя — {bike['price_week']}₽", callback_data=f"{prefix}неделя")],
-        [InlineKeyboardButton(text=f"Месяц — {bike['price_month']}₽", callback_data=f"{prefix}месяц")],
-    ])
-
-
-def main_menu_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🚲 Арендовать велосипед")],
-            [KeyboardButton(text="📋 Мои аренды"), KeyboardButton(text="ℹ️ Помощь")],
-        ],
-        resize_keyboard=True
-    )
-
-
-def admin_menu_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📋 Активные аренды"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="💰 Отчёт"), KeyboardButton(text="🧹 Сброс теста")],
-            [KeyboardButton(text="❓ Все команды")],
-        ],
-        resize_keyboard=True
-    )
-
-
-# ------------------ БОТ ------------------
-
-storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=storage)
-router = Router()
-dp.include_router(router)
 
 
 class Registration(StatesGroup):
