@@ -15,7 +15,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile,
-    ReplyKeyboardMarkup, KeyboardButton, BotCommand, BotCommandScopeDefault
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -659,9 +659,21 @@ async def check_reminders():
 
 
 async def setup_commands():
-    # Перезаписываем список команд в Telegram — убирает старые /rentals, /stats и т.д.,
-    # которые остались в меню от предыдущей версии бота.
+    # Перезаписываем общий список команд — убирает старые /rentals, /stats и т.д.
     await bot.set_my_commands([BotCommand(command="start", description="Открыть меню")], scope=BotCommandScopeDefault())
+
+    # ВАЖНО: старая версия бота регистрировала расширенный список команд отдельно
+    # для личных чатов админа и партнёра (BotCommandScopeChat) — такие команды
+    # перекрывают общий список и не удаляются его обновлением. Стираем их явно.
+    try:
+        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception as e:
+        log.warning(f"Не удалось очистить команды у ADMIN_ID: {e}")
+    if FRIEND_ID:
+        try:
+            await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=FRIEND_ID))
+        except Exception as e:
+            log.warning(f"Не удалось очистить команды у FRIEND_ID: {e}")
 
 
 async def main():
