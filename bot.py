@@ -15,7 +15,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile,
-    ReplyKeyboardMarkup, KeyboardButton
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand, BotCommandScopeDefault
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -658,7 +658,14 @@ async def check_reminders():
                 log.warning(f"Не удалось отправить напоминание {uid}: {e}")
 
 
+async def setup_commands():
+    # Перезаписываем список команд в Telegram — убирает старые /rentals, /stats и т.д.,
+    # которые остались в меню от предыдущей версии бота.
+    await bot.set_my_commands([BotCommand(command="start", description="Открыть меню")], scope=BotCommandScopeDefault())
+
+
 async def main():
+    await setup_commands()
     scheduler = AsyncIOScheduler(timezone="Europe/Volgograd")
     scheduler.add_job(check_reminders, "cron", hour=10, minute=0)
     scheduler.start()
