@@ -141,17 +141,19 @@ def create_rental(bike_id, client_id, period, price):
     start = datetime.now()
     end = start + timedelta(days=PERIOD_DAYS[period])
 
+    client = get_client_by_id(client_id)
+    bike, _ = get_bike_by_id(bike_id)
+    client_name = client.get("ФИО", "") if client else ""
+    bike_owner = bike.get("Владелец", "") if bike else ""
+
     rentals_ws.append_row([
-        new_id, client_id, "", bike_id, "",
+        new_id, client_id, client_name, bike_id, bike_owner,
         period, start.strftime("%d.%m.%Y"), end.strftime("%d.%m.%Y"),
         "Арендован", price, "Оплачено", "Нет", "", ""
     ])
-    new_row = len(rows) + 2
-    rentals_ws.update_cell(new_row, 3, f'=IFERROR(INDEX(Клиенты!C:C,MATCH(B{new_row},Клиенты!A:A,0)),"")')
-    rentals_ws.update_cell(new_row, 5, f'=IFERROR(INDEX(Велосипеды!C:C,MATCH(D{new_row},Велосипеды!A:A,0)),"")')
 
     set_bike_status(bike_id, "В аренде")
-    add_finance_row("Доход", "аренда", price, get_bike_by_id(bike_id)[0]["Владелец"], f"аренда {new_id}", bike_id, new_id)
+    add_finance_row("Доход", "аренда", price, bike_owner, f"аренда {new_id}", bike_id, new_id)
     return new_id, start, end
 
 
